@@ -133,15 +133,30 @@ namespace Term {
 		width += (proc ? Proc::min_width : 0);
 		if (cpu and width < Cpu::min_width) width = Cpu::min_width;
 	#ifdef GPU_SUPPORT
-		if (gpu != 0 and width < Gpu::min_width) width = Gpu::min_width;
+		int gpu_cols = 0;
+		if (gpu != 0) {
+			gpu_cols = (Term::width < Term::height or gpu < 2) ? 1 : std::clamp(Term::width / Gpu::min_width, 1, gpu);
+			width = max(width, gpu_cols * Gpu::min_width);
+		}
 	#endif
 
 		int height = (cpu ? Cpu::min_height : 0);
 		if (proc) height += Proc::min_height;
 		else height += (mem ? Mem::min_height : 0) + (net ? Net::min_height : 0);
 	#ifdef GPU_SUPPORT
-		for (int i = 0; i < gpu; i++)
-			height += Gpu::gpu_b_height_offsets[i] + 4;
+		if (gpu != 0) {
+			const int gpu_rows = (gpu + gpu_cols - 1) / gpu_cols;
+			if (gpu_cols == 1) {
+				for (int i = 0; i < gpu; i++)
+					height += Gpu::gpu_b_height_offsets[i] + 4;
+			}
+			else {
+				int row_min_height = 0;
+				for (int i = 0; i < gpu; i++)
+					row_min_height = max(row_min_height, Gpu::gpu_b_height_offsets[i] + 4);
+				height += gpu_rows * row_min_height;
+			}
+		}
 	#endif
 
 		return { width, height };

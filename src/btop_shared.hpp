@@ -108,8 +108,8 @@ namespace Shared {
 
 namespace Gpu {
 	extern vector<string> box;
-	extern int width, total_height, min_width, min_height;
-	extern vector<int> x_vec, y_vec;
+	extern int total_height, min_width, min_height;
+	extern vector<int> width_vec, x_vec, y_vec, b_width_vec;
 	extern vector<bool> redraw;
 	extern int shown;
 	extern int count;

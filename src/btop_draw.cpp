@@ -999,9 +999,8 @@ namespace Cpu {
 namespace Gpu {
 	int width_p = 100, height_p = 32;
 	int min_width = 41, min_height = 8;
-	int width = 41, total_height;
-	vector<int> x_vec = {}, y_vec = {}, b_height_vec = {};
-	int b_width;
+	int total_height;
+	vector<int> width_vec = {}, x_vec = {}, y_vec = {}, b_height_vec = {}, b_width_vec = {};
 	vector<int> b_x_vec = {}, b_y_vec = {};
 	vector<bool> redraw = {};
 	int shown = 0;
@@ -1023,6 +1022,8 @@ namespace Gpu {
 		auto& b_y = b_y_vec[index];
 		auto& x = x_vec[index];
 		auto& y = y_vec[index];
+		const int width = width_vec.at(index);
+		const int b_width = b_width_vec.at(index);
 
 		auto& graph_upper = graph_upper_vec[index];
 		auto& graph_lower = graph_lower_vec[index];
@@ -1052,10 +1053,10 @@ namespace Gpu {
 			int graph_low_height = single_graph ? 0 : b_height_vec[index] - graph_up_height;
 
 			if (gpu.supported_functions.gpu_utilization) {
-				graph_upper = Draw::Graph{x + width - b_width - 3, graph_up_height, "cpu", safeVal(gpu.gpu_percent, "gpu-totals"s), graph_symbol, false, true}; // TODO cpu -> gpu
+				graph_upper = Draw::Graph{width - b_width - 2, graph_up_height, "cpu", safeVal(gpu.gpu_percent, "gpu-totals"s), graph_symbol, false, true}; // TODO cpu -> gpu
             	if (not single_graph) {
                 	graph_lower = Draw::Graph{
-                    	x + width - b_width - 3,
+                    	width - b_width - 2,
                     	graph_low_height, "cpu",
                     	safeVal(gpu.gpu_percent, "gpu-totals"s),
                     	graph_symbol,
@@ -2248,7 +2249,6 @@ namespace Draw {
 		Cpu::shown = boxes.contains("cpu");
 	#ifdef GPU_SUPPORT
 		Gpu::box.clear();
-		Gpu::width = 0;
 		Gpu::shown_panels.clear();
 		if (Gpu::count > 0) {
 			std::istringstream iss(boxes, std::istringstream::in);
@@ -2260,12 +2260,26 @@ namespace Draw {
 		}
 		Gpu::shown = Gpu::shown_panels.size();
 
+		//? Panels are laid out in a grid when the terminal is landscape (width >= height),
+		//? stacked vertically in a single column otherwise
+		const int gpu_cols = (Term::width < Term::height or Gpu::shown < 2)
+			? 1
+			: clamp(Term::width / Gpu::min_width, 1, Gpu::shown);
+		const int gpu_rows = (Gpu::shown + gpu_cols - 1) / gpu_cols;
+
 		// Calculate the minimum possible GPU height, store in total_height
 		// The actual total_height value will of course be overwritten later
 		Gpu::total_height = 0;
-		for (int i = 0; i < Gpu::shown; i++) {
-			using namespace Gpu;
-			total_height += 4 + gpu_b_height_offsets[shown_panels[i]];
+		if (gpu_cols > 1) {
+			for (int i = 0; i < Gpu::shown; i++)
+				Gpu::total_height = max(Gpu::total_height, 4 + Gpu::gpu_b_height_offsets[Gpu::shown_panels[i]]);
+			Gpu::total_height *= gpu_rows;
+		}
+		else {
+			for (int i = 0; i < Gpu::shown; i++) {
+				using namespace Gpu;
+				total_height += 4 + gpu_b_height_offsets[shown_panels[i]];
+			}
 		}
 	#endif
 		Mem::shown = boxes.contains("mem");
@@ -2288,7 +2302,7 @@ namespace Draw {
 			if (Gpu::shown != 0 and not (Mem::shown or Net::shown or Proc::shown)) {
 				height = Term::height - Gpu::total_height - gpus_extra_height;
 			} else {
-				height = max(8, (int)ceil((double)Term::height * (trim(boxes) == "cpu" ? 100 : height_p/(Gpu::shown+1) + (Gpu::shown != 0)*5) / 100));
+				height = max(8, (int)ceil((double)Term::height * (trim(boxes) == "cpu" ? 100 : height_p/(gpu_rows+1) + (gpu_rows != 0)*5) / 100));
 			}
 			if (height <= Term::height-gpus_extra_height) height += gpus_extra_height;
 		#else
@@ -2349,8 +2363,10 @@ namespace Draw {
 		//* Calculate and draw gpu box outlines
 		if (Gpu::shown != 0) {
 			using namespace Gpu;
+			width_vec.resize(shown);
 			x_vec.resize(shown); y_vec.resize(shown);
 			b_x_vec.resize(shown); b_y_vec.resize(shown);
+			b_width_vec.resize(shown);
 			b_height_vec.resize(shown);
 			box.resize(shown);
 			graph_upper_vec.resize(shown); graph_lower_vec.resize(shown);
@@ -2360,37 +2376,59 @@ namespace Draw {
 			pwr_meter_vec.resize(shown);
 			enc_meter_vec.resize(shown);
 			redraw.resize(shown);
+
+			//? Height of each row of panels, sharing leftover height with the last rows
+			vector<int> row_heights(gpu_rows, 0), row_y(gpu_rows, 0);
+			for (int r = 0; r < gpu_rows; r++) {
+				if (Cpu::shown)
+					row_heights[r] = (not (Mem::shown or Net::shown or Proc::shown)) ? min_height : Cpu::height;
+				else if (not (Mem::shown or Net::shown or Proc::shown))
+					row_heights[r] = Term::height / gpu_rows + (gpu_rows - 1 - r < Term::height % gpu_rows);
+				else
+					row_heights[r] = max(min_height, (int)ceil((double)Term::height * height_p / 100 / gpu_rows));
+				row_heights[r] += (row_heights[r] + Cpu::height == Term::height-1);
+			}
+			vector<int> row_min(gpu_rows, 0);
+			for (auto i = 0; i < shown; ++i)
+				row_min[i / gpu_cols] = max(row_min[i / gpu_cols], gpu_b_height_offsets[shown_panels[i]] + 4);
+			for (int r = 0; r < gpu_rows; r++) {
+				row_heights[r] = max(row_heights[r], row_min[r]);
+				//? Leave room for the other boxes' minimum sizes instead of growing into them
+				if (Mem::shown or Net::shown or Proc::shown)
+					row_heights[r] = min(row_heights[r],
+						max(row_min[r], (Term::height - Cpu::height - (Mem::shown ? Mem::min_height : 0)
+							- (Net::shown ? Net::min_height : 0) - (Proc::shown ? Proc::min_height : 0)) / gpu_rows));
+			}
+
 			total_height = 0;
+			int next_y = 1 + (not Config::getB("cpu_bottom"))*Cpu::shown*Cpu::height;
+			for (int r = 0; r < gpu_rows; r++) {
+				row_y[r] = next_y;
+				next_y += row_heights[r];
+				total_height += row_heights[r];
+			}
+
 			for (auto i = 0; i < shown; ++i) {
 				redraw[i] = true;
-				int height = 0;
-				width = Term::width;
-				if (Cpu::shown)
-					if (not (Mem::shown or Net::shown or Proc::shown))
-						height = min_height;
-					else height = Cpu::height;
-				else
-					if (not (Mem::shown or Net::shown or Proc::shown))
-						height = (Term::height - total_height) / (Gpu::shown - i) + (i == 0) * ((Term::height - total_height) % (Gpu::shown - i));
-					else
-						height = max(min_height, (int)ceil((double)Term::height * height_p/Gpu::shown / 100));
-
+				const int col = i % gpu_cols, row = i / gpu_cols;
+				const int height = row_heights[row];
+				width_vec[i] = Term::width * (col + 1) / gpu_cols - Term::width * col / gpu_cols;
+				x_vec[i] = Term::width * col / gpu_cols + 1;
+				y_vec[i] = row_y[row];
 				b_height_vec[i] = gpu_b_height_offsets[shown_panels[i]] + 2;
-				height += (height+Cpu::height == Term::height-1);
-				height = max(height, b_height_vec[i] + 2);
-				x_vec[i] = 1; y_vec[i] = 1 + total_height + (not Config::getB("cpu_bottom"))*Cpu::shown*Cpu::height;
-				box[i] = createBox(x_vec[i], y_vec[i], width, height, Theme::c("cpu_box"), true, std::string("gpu") + (char)(shown_panels[i]+'0'), "", (shown_panels[i]+5)%10); // TODO gpu_box
-				b_width = clamp(width/2, min_width, 65);
-				total_height += height;
+				box[i] = createBox(x_vec[i], y_vec[i], width_vec[i], height, Theme::c("cpu_box"), true, std::string("gpu") + (char)(shown_panels[i]+'0'), "", (shown_panels[i]+5)%10); // TODO gpu_box
+				b_width_vec[i] = (gpu_cols > 1)
+					? min(clamp(width_vec[i]/2, min_width, 65), width_vec[i] - 4)
+					: clamp(width_vec[i]/2, min_width, 65);
 
 				//? Main statistics box
-				b_x_vec[i] = x_vec[i] + width - b_width - 1;
+				b_x_vec[i] = x_vec[i] + width_vec[i] - b_width_vec[i] - 1;
 				b_y_vec[i] = y_vec[i] + ceil((double)(height - 2 - b_height_vec[i]) / 2) + 1;
 
 				string name = Config::getS(std::string("custom_gpu_name") + (char)(shown_panels[i]+'0'));
 				if (name.empty()) name = gpu_names[shown_panels[i]];
 
-				box[i] += createBox(b_x_vec[i], b_y_vec[i], b_width, b_height_vec[i], "", false, name.substr(0, b_width-5));
+				box[i] += createBox(b_x_vec[i], b_y_vec[i], b_width_vec[i], b_height_vec[i], "", false, name.substr(0, b_width_vec[i]-5));
 				b_height_vec[i] = height - 2;
 			}
 		}

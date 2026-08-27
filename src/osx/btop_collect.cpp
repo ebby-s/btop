@@ -48,6 +48,7 @@ tab-size = 4
 #include <utility>
 
 #include <cmath>
+#include <algorithm>
 #include <fstream>
 #include <mutex>
 #include <numeric>
@@ -597,6 +598,7 @@ namespace Gpu {
 		long long mem_usage_total = 0;
 		long long mem_total = 0;
 		long long pwr_total = 0;
+		const int gpu_width = Gpu::width_vec.empty() ? 0 : *std::max_element(Gpu::width_vec.begin(), Gpu::width_vec.end());
 		for (auto& gpu : gpus) {
 			if (gpu.supported_functions.gpu_utilization and not gpu.gpu_percent.at("gpu-totals").empty())
 				avg += gpu.gpu_percent.at("gpu-totals").back();
@@ -608,12 +610,12 @@ namespace Gpu {
 				pwr_total += gpu.pwr_usage;
 
 			//* Trim vectors if there are more values than needed for graphs
-			if (width != 0) {
-				while (cmp_greater(gpu.gpu_percent.at("gpu-totals").size(), width * 2)) gpu.gpu_percent.at("gpu-totals").pop_front();
-				while (cmp_greater(gpu.mem_utilization_percent.size(), width)) gpu.mem_utilization_percent.pop_front();
-				while (cmp_greater(gpu.gpu_percent.at("gpu-pwr-totals").size(), width)) gpu.gpu_percent.at("gpu-pwr-totals").pop_front();
+			if (gpu_width != 0) {
+				while (cmp_greater(gpu.gpu_percent.at("gpu-totals").size(), gpu_width * 2)) gpu.gpu_percent.at("gpu-totals").pop_front();
+				while (cmp_greater(gpu.mem_utilization_percent.size(), gpu_width)) gpu.mem_utilization_percent.pop_front();
+				while (cmp_greater(gpu.gpu_percent.at("gpu-pwr-totals").size(), gpu_width)) gpu.gpu_percent.at("gpu-pwr-totals").pop_front();
 				while (cmp_greater(gpu.temp.size(), 18)) gpu.temp.pop_front();
-				while (cmp_greater(gpu.gpu_percent.at("gpu-vram-totals").size(), width/2)) gpu.gpu_percent.at("gpu-vram-totals").pop_front();
+				while (cmp_greater(gpu.gpu_percent.at("gpu-vram-totals").size(), gpu_width/2)) gpu.gpu_percent.at("gpu-vram-totals").pop_front();
 			}
 		}
 
@@ -625,10 +627,10 @@ namespace Gpu {
 				shared_gpu_percent.at("gpu-pwr-total").push_back(pwr_total * 100 / gpu_pwr_total_max);
 		}
 
-		if (width != 0) {
-			while (cmp_greater(shared_gpu_percent.at("gpu-average").size(), width * 2)) shared_gpu_percent.at("gpu-average").pop_front();
-			while (cmp_greater(shared_gpu_percent.at("gpu-vram-total").size(), width)) shared_gpu_percent.at("gpu-vram-total").pop_front();
-			while (cmp_greater(shared_gpu_percent.at("gpu-pwr-total").size(), width)) shared_gpu_percent.at("gpu-pwr-total").pop_front();
+		if (gpu_width != 0) {
+			while (cmp_greater(shared_gpu_percent.at("gpu-average").size(), gpu_width * 2)) shared_gpu_percent.at("gpu-average").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-vram-total").size(), gpu_width)) shared_gpu_percent.at("gpu-vram-total").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-pwr-total").size(), gpu_width)) shared_gpu_percent.at("gpu-pwr-total").pop_front();
 		}
 
 		return gpus;

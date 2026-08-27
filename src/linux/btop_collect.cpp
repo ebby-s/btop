@@ -110,6 +110,10 @@ long long get_monotonicTimeUSec()
 	return time.tv_sec * 1000000 + time.tv_nsec / 1000;
 }
 
+//? Set to true when at least one intel-rapl package energy counter was
+//? successfully read (so CPU wattage can be shown).
+bool rapl_ok = false;
+
 // Wrapper with join behavior of std::jthread to avoid -fexperimental-library
 // flag usage for Clang 19, ideally replace once flag is no longer needed.
 struct join_thread
@@ -1007,14 +1011,51 @@ namespace Cpu {
 
 	long long get_cpuConsumptionUJoules()
 	{
-		long long consumption = -1;
-		const auto rapl_power_usage_path = "/sys/class/powercap/intel-rapl:0/energy_uj";
-		std::ifstream file(rapl_power_usage_path);
-		if(file.good())
-		{
-			file >> consumption;
+		//? Sum the accumulated package energy across ALL intel-rapl package
+		//? domains (dual-socket systems expose intel-rapl:0 and intel-rapl:1),
+		//? handling the per-domain 32-bit counter wrap-around so readings never
+		//? spike to absurd values when a counter crosses max_energy_range_uj.
+		static std::unordered_map<std::string, long long> prev;
+		static long long cumulative = 0;
+		static bool seeded = false;
+
+		const fs::path rapl_dir = "/sys/class/powercap";
+		if (fs::exists(rapl_dir)) {
+			try {
+				for (const auto& d : fs::directory_iterator(rapl_dir)) {
+					const auto name_path = d.path() / "name";
+					if (not fs::is_regular_file(name_path)) continue;
+					std::string name;
+					if (not (std::ifstream(name_path) >> name)) continue;
+					if (not name.starts_with("package-")) continue; //? skip core (pp0), DRAM, psys, etc.
+
+					const auto energy_path = d.path() / "energy_uj";
+					const auto max_path = d.path() / "max_energy_range_uj";
+					long long energy = 0;
+					if (not (std::ifstream(energy_path) >> energy)) continue;
+					rapl_ok = true;
+
+					long long max_range = 262143328850; //? default: 32-bit counter, ~61uJ LSB
+					if (fs::is_regular_file(max_path)) {
+						if (not (std::ifstream(max_path) >> max_range) or max_range <= 0)
+							max_range = 262143328850;
+					}
+
+					const std::string key = d.path().filename().string();
+					if (not seeded) {
+						prev[key] = energy;
+						continue;
+					}
+
+					long long delta = (energy - prev[key]) % max_range;
+					if (delta < 0) delta += max_range;
+					cumulative += delta;
+					prev[key] = energy;
+				}
+			} catch (...) { }
 		}
-		return consumption;
+		seeded = true;
+		return cumulative;
 	}
 
 	float get_cpuConsumptionWatts()
@@ -1026,7 +1067,7 @@ namespace Cpu {
 		{
 			previous_usage = get_cpuConsumptionUJoules();
 			previous_timestamp = get_monotonicTimeUSec();
-			supports_watts = (previous_usage > 0);
+			supports_watts = rapl_ok;
 			return 0;
 		}
 
@@ -2013,6 +2054,7 @@ namespace Gpu {
 		long long mem_usage_total = 0;
 		long long mem_total = 0;
 		long long pwr_total = 0;
+		const int gpu_width = Gpu::width_vec.empty() ? 0 : *std::max_element(Gpu::width_vec.begin(), Gpu::width_vec.end());
 		for (auto& gpu : gpus) {
 			if (gpu.supported_functions.gpu_utilization)
 				avg += gpu.gpu_percent.at("gpu-totals").back();
@@ -2024,16 +2066,16 @@ namespace Gpu {
 				pwr_total += gpu.pwr_usage;
 
 			//* Trim vectors if there are more values than needed for graphs
-			if (width != 0) {
+			if (gpu_width != 0) {
 				//? GPU & memory utilization
-				while (cmp_greater(gpu.gpu_percent.at("gpu-totals").size(), width * 2)) gpu.gpu_percent.at("gpu-totals").pop_front();
-				while (cmp_greater(gpu.mem_utilization_percent.size(), width)) gpu.mem_utilization_percent.pop_front();
+				while (cmp_greater(gpu.gpu_percent.at("gpu-totals").size(), gpu_width * 2)) gpu.gpu_percent.at("gpu-totals").pop_front();
+				while (cmp_greater(gpu.mem_utilization_percent.size(), gpu_width)) gpu.mem_utilization_percent.pop_front();
 				//? Power usage
-				while (cmp_greater(gpu.gpu_percent.at("gpu-pwr-totals").size(), width)) gpu.gpu_percent.at("gpu-pwr-totals").pop_front();
+				while (cmp_greater(gpu.gpu_percent.at("gpu-pwr-totals").size(), gpu_width)) gpu.gpu_percent.at("gpu-pwr-totals").pop_front();
 				//? Temperature
 				while (cmp_greater(gpu.temp.size(), 18)) gpu.temp.pop_front();
 				//? Memory usage
-				while (cmp_greater(gpu.gpu_percent.at("gpu-vram-totals").size(), width/2)) gpu.gpu_percent.at("gpu-vram-totals").pop_front();
+				while (cmp_greater(gpu.gpu_percent.at("gpu-vram-totals").size(), gpu_width/2)) gpu.gpu_percent.at("gpu-vram-totals").pop_front();
 			}
 		}
 
@@ -2043,10 +2085,10 @@ namespace Gpu {
 		if (gpu_pwr_total_max != 0)
 			shared_gpu_percent.at("gpu-pwr-total").push_back(clamp(static_cast<long long>(round(pwr_total * 100.0 / gpu_pwr_total_max)), 0ll, 100ll));
 
-		if (width != 0) {
-			while (cmp_greater(shared_gpu_percent.at("gpu-average").size(), width * 2)) shared_gpu_percent.at("gpu-average").pop_front();
-			while (cmp_greater(shared_gpu_percent.at("gpu-pwr-total").size(), width * 2)) shared_gpu_percent.at("gpu-pwr-total").pop_front();
-			while (cmp_greater(shared_gpu_percent.at("gpu-vram-total").size(), width * 2)) shared_gpu_percent.at("gpu-vram-total").pop_front();
+		if (gpu_width != 0) {
+			while (cmp_greater(shared_gpu_percent.at("gpu-average").size(), gpu_width * 2)) shared_gpu_percent.at("gpu-average").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-pwr-total").size(), gpu_width * 2)) shared_gpu_percent.at("gpu-pwr-total").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-vram-total").size(), gpu_width * 2)) shared_gpu_percent.at("gpu-vram-total").pop_front();
 		}
 
 		count = gpus.size();
