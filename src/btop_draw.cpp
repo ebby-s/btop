@@ -558,15 +558,19 @@ namespace Cpu {
 		const bool gpu_auto = show_gpu_info == "Auto";
 		const bool show_gpu = (gpus.size() > 0 and (gpu_always or (gpu_auto and Gpu::shown < Gpu::count)));
 #endif // GPU_SUPPORT
+		//? Mirror per-socket graphs when the system has 2+ physical CPU packages
+		const bool two_pkgs = (not single_graph)
+			and v_contains(Cpu::available_fields, "pkg-0")
+			and v_contains(Cpu::available_fields, "pkg-1");
 		auto graph_up_field = Config::getS("cpu_graph_upper");
 		if (graph_up_field == "Auto" or not v_contains(Cpu::available_fields, graph_up_field))
-			graph_up_field = "total";
+			graph_up_field = two_pkgs ? "pkg-0" : "total";
 		auto graph_lo_field = Config::getS("cpu_graph_lower");
 		if (graph_lo_field == "Auto" or not v_contains(Cpu::available_fields, graph_lo_field)) {
 		#ifdef GPU_SUPPORT
-			graph_lo_field = show_gpu ? "gpu-totals" : graph_up_field;
+			graph_lo_field = two_pkgs ? "pkg-1" : (show_gpu ? "gpu-totals" : graph_up_field);
 		#else
-			graph_lo_field = graph_up_field;
+			graph_lo_field = two_pkgs ? "pkg-1" : graph_up_field;
 		#endif
 		}
 		auto tty_mode = Config::getB("tty_mode");
@@ -663,7 +667,8 @@ namespace Cpu {
 
             init_graphs(graphs_upper, graph_up_height, graph_up_width, graph_up_field, false);
             if (not single_graph)
-            	init_graphs(graphs_lower, graph_low_height, graph_low_width, graph_lo_field, Config::getB("cpu_invert_lower"));
+            	init_graphs(graphs_lower, graph_low_height, graph_low_width, graph_lo_field,
+            		Config::getB("cpu_invert_lower") or graph_lo_field.starts_with("pkg-"));
 
 			#ifdef GPU_SUPPORT
 			if (show_gpu and b_columns > 1) {

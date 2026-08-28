@@ -146,6 +146,10 @@ struct join_thread
 namespace Cpu {
 	vector<long long> core_old_totals;
 	vector<long long> core_old_idles;
+	//* Per physical package (socket) utilization tracking
+	vector<int> core_to_pkg;
+	vector<long long> pkg_delta_totals;
+	vector<long long> pkg_delta_idles;
 	vector<fs::path> core_freq;
 	vector<string> available_fields = {"Auto", "total"};
 	vector<string> available_sensors = {"Auto"};
@@ -1118,9 +1122,34 @@ namespace Cpu {
                std::views::join | std::ranges::to<std::vector<std::int32_t>>();
     }
 
+	//* Build core -> physical package (socket) mapping from sysfs
+	auto get_pkg_mapping() {
+		core_to_pkg.clear();
+		for (int c = 0; c < Shared::coreCount; c++) {
+			ifstream pkg_file("/sys/devices/system/cpu/cpu" + to_string(c) + "/topology/physical_package_id");
+			int pkg = -1;
+			pkg_file >> pkg;
+			if (not pkg_file or pkg < 0) {
+				core_to_pkg.clear();
+				return;
+			}
+			core_to_pkg.push_back(pkg);
+		}
+		if (not core_to_pkg.empty()) {
+			const int max_pkg = *max_element(core_to_pkg.begin(), core_to_pkg.end());
+			while (cmp_less(pkg_delta_totals.size(), (size_t)max_pkg + 1)) {
+				pkg_delta_totals.push_back(0);
+				pkg_delta_idles.push_back(0);
+			}
+		}
+	}
+
 	auto collect(bool no_update) -> cpu_info& {
 		if (Runner::stopping or (no_update and not current_cpu.cpu_percent.at("total").empty())) return current_cpu;
 		auto& cpu = current_cpu;
+
+		if (core_to_pkg.size() != (size_t)Shared::coreCount)
+			get_pkg_mapping();
 
 		if (Config::getB("show_cpu_freq"))
 			cpuHz = get_cpuHz();
@@ -1227,6 +1256,15 @@ namespace Cpu {
 						core_old_idles.at(i-1) = idles;
 
 						cpu.core_percent.at(i-1).push_back(clamp((long long)round((double)(calc_totals - calc_idles) * 100 / calc_totals), 0ll, 100ll));
+
+						//? Accumulate core deltas into its physical package (socket)
+						if (not core_to_pkg.empty() and cmp_less(i - 1, (int)core_to_pkg.size())) {
+							const int pkg = core_to_pkg.at(i - 1);
+							if (pkg < (int)pkg_delta_totals.size()) {
+								pkg_delta_totals.at(pkg) += calc_totals;
+								pkg_delta_idles.at(pkg) += calc_idles;
+							}
+						}
 					}
 				}
 
@@ -1240,6 +1278,22 @@ namespace Cpu {
 				Runner::coreNum_reset = true;
 				Shared::coreCount = cpu.core_percent.size();
 				while (cmp_less(current_cpu.temp.size(), cpu.core_percent.size() + 1)) current_cpu.temp.push_back({0});
+			}
+
+			//? Calculate utilization for each physical package (socket)
+			if (not core_to_pkg.empty()) {
+				for (size_t p = 0; p < pkg_delta_totals.size(); p++) {
+					const long long calc_totals = max(1ll, pkg_delta_totals.at(p));
+					const long long calc_idles = max(0ll, pkg_delta_idles.at(p));
+					auto& pkg_hist = cpu.cpu_percent[fmt::format("pkg-{}", p)];
+					pkg_hist.push_back(clamp((long long)round((double)(calc_totals - calc_idles) * 100 / calc_totals), 0ll, 100ll));
+
+					//? Reduce size if there are more values than needed for graph
+					while (cmp_greater(pkg_hist.size(), width * 2)) pkg_hist.pop_front();
+
+					pkg_delta_totals.at(p) = 0;
+					pkg_delta_idles.at(p) = 0;
+				}
 			}
 
 		}
