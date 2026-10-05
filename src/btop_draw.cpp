@@ -20,6 +20,7 @@ tab-size = 4
 #include <array>
 #include <cmath>
 #include <iterator>
+#include <map>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -519,8 +520,8 @@ namespace Cpu {
 	int width_p = 100, height_p = 32;
 	int min_width = 60, min_height = 8;
 	int x = 1, y = 1, width = 20, height;
-	int b_columns, b_column_size;
-	int b_x, b_y, b_width, b_height;
+	int b_width, b_height;
+	int b_x, b_y;
 	float max_observed_pwr = 1.0f;
 
 	int graph_up_height, graph_low_height;
@@ -532,8 +533,12 @@ namespace Cpu {
 	vector<Draw::Graph> graphs_lower;
 	Draw::Meter cpu_meter;
 	vector<Draw::Meter> gpu_meters;
-	vector<Draw::Graph> core_graphs;
-	vector<Draw::Graph> temp_graphs;
+
+	//* Dot-grid layout of the per-thread utilization display
+	vector<vector<int>> pkg_threads;              //? Thread ids per socket, SMT siblings adjacent, ordered by core id
+	vector<std::array<int, 3>> dot_cells;         //? {thread id, grid row, grid column} of every visible dot
+	int grid_rows = 1, threads_per_core = 1;
+	int per_socket_width = 1;                     //? Character width of one socket's dot grid
 	vector<Draw::Graph> gpu_temp_graphs;
 	vector<Draw::Graph> gpu_mem_graphs;
 
@@ -550,8 +555,7 @@ namespace Cpu {
 		bool show_temps = (Config::getB("check_temp") and got_sensors);
 		bool show_watts = (Config::getB("show_cpu_watts") and supports_watts);
 		auto single_graph = Config::getB("cpu_single_graph");
-		bool hide_cores = show_temps and (cpu_temp_only or not Config::getB("show_coretemp"));
-		const int extra_width = (hide_cores ? max(6, 6 * b_column_size) : (b_columns == 1 && !show_temps) ? 8 : 0);
+		[[maybe_unused]] const bool b_wide = b_width >= 26; //? Enough room for meters and extra columns in the summary box
 #if defined(GPU_SUPPORT)
 		const auto& show_gpu_info = Config::getS("show_gpu_info");
 		const bool gpu_always = show_gpu_info == "On";
@@ -576,6 +580,9 @@ namespace Cpu {
 		auto tty_mode = Config::getB("tty_mode");
 		auto& graph_symbol = (tty_mode ? "tty" : Config::getS("graph_symbol_cpu"));
 		auto& graph_bg = Symbols::graph_symbols.at((graph_symbol == "default" ? Config::getS("graph_symbol") + "_up" : graph_symbol + "_up")).at(6);
+		//? Single-dot glyph from the same graph symbol set (one braille dot at the baseline,
+		//? one quarter block) so each thread is exactly one dot, not the 2-dot graph baseline cell
+		auto& thread_dot = Symbols::graph_symbols.at((graph_symbol == "default" ? Config::getS("graph_symbol") + "_up" : graph_symbol + "_up")).at(1);
 		auto& temp_scale = Config::getS("temp_scale");
 		auto cpu_bottom = Config::getB("cpu_bottom");
 		const auto safe_cpu_temp_max = cpu.temp_max <= 0 ? 90 : cpu.temp_max;
@@ -671,7 +678,7 @@ namespace Cpu {
             		Config::getB("cpu_invert_lower") or graph_lo_field.starts_with("pkg-"));
 
 			#ifdef GPU_SUPPORT
-			if (show_gpu and b_columns > 1) {
+			if (show_gpu and b_wide) {
 				gpu_temp_graphs.resize(gpus.size());
 				gpu_mem_graphs.resize(gpus.size());
 				gpu_meters.resize(gpus.size());
@@ -690,7 +697,7 @@ namespace Cpu {
 						gpu_temp_graphs[i] = Draw::Graph{ gpu_graph_width, 1, "temp", gpu.temp, graph_symbol, false, false, gpu.temp_max, -23 };
 						width_left -= 11;
 					}
-					if (gpu.supported_functions.mem_used and gpu.supported_functions.mem_total and b_columns > 1) {
+					if (gpu.supported_functions.mem_used and gpu.supported_functions.mem_total and b_wide) {
 						gpu_mem_graphs[i] = Draw::Graph{ gpu_graph_width, 1, "used", safeVal(gpu.gpu_percent, "gpu-vram-totals"s), graph_symbol };
 						width_left -= 5;
 					}
@@ -704,35 +711,14 @@ namespace Cpu {
 			}
 			#endif
 
-			int cpu_meter_width = b_width - (show_temps ? 23 - (b_column_size <= 1 and b_columns == 1 ? 6 : 0) : 11);
-			if (show_watts) {
-				cpu_meter_width -= 6;
-			}
-
-			cpu_meter = Draw::Meter{cpu_meter_width, "cpu"};
+			//? Total utilization meter, frequency/temperature/power are shown per socket below the dot grid
+			cpu_meter = Draw::Meter{max(4, b_width - 11), "cpu"};
 
 			if (mid_line) {
 				out += Mv::to(y + graph_up_height + 1, x) + Fx::ub + Theme::c("cpu_box") + Symbols::div_left + Theme::c("div_line")
 					+ Symbols::h_line * (width - b_width - 2) + Symbols::div_right
 					+ Mv::to(y + graph_up_height + 1, x + ((width - b_width) / 2) - ((graph_up_field.size() + graph_lo_field.size()) / 2) - 4)
 					+ Theme::c("main_fg") + graph_up_field + Mv::r(1) + "▲▼" + Mv::r(1) + graph_lo_field;
-			}
-
-			if (b_column_size > 0 or extra_width > 0) {
-				core_graphs.clear();
-				for (const auto& core_data : cpu.core_percent) {
-					core_graphs.emplace_back(5 * b_column_size + extra_width, 1, "cpu", core_data, graph_symbol);
-				}
-			}
-
-			if (show_temps) {
-				temp_graphs.clear();
-				temp_graphs.emplace_back(5, 1, "temp", safeVal(cpu.temp, 0), graph_symbol, false, false, safe_cpu_temp_max, -23);
-				if (not hide_cores and b_column_size > 1) {
-					for (const auto& i : iota((size_t)1, cpu.temp.size())) {
-						temp_graphs.emplace_back(5, 1, "temp", safeVal(cpu.temp, i), graph_symbol, false, false, safe_cpu_temp_max, -23);
-					}
-				}
 			}
 		}
 
@@ -834,137 +820,178 @@ namespace Cpu {
 					+ Theme::c("graph_text") + "up" + Mv::r(1) + upstr;
 			}
 
-		#ifdef __linux__
-			const bool freq_range = Config::getS("freq_mode") == "range";
-		#else
-			const bool freq_range = false;
-		#endif
-
-			//? Cpu clock and cpu meter
-			if (Config::getB("show_cpu_freq") and not cpuHz.empty())
-				out += Mv::to(b_y, b_x + b_width - (freq_range ? 20 : 10)) + Fx::ub + Theme::c("div_line")
-					+ Symbols::h_line * ((freq_range ? 17 : 7) - cpuHz.size())
-					+ Symbols::title_left + Fx::b + Theme::c("title") + cpuHz + Fx::ub + Theme::c("div_line") + Symbols::title_right;
-
+			//? Total utilization meter
 			out += Mv::to(b_y + 1, b_x + 1) + Theme::c("main_fg") + Fx::b + "CPU " + cpu_meter(safeVal(cpu.cpu_percent, "total"s).back())
 				+ Theme::g("cpu").at(clamp(safeVal(cpu.cpu_percent, "total"s).back(), 0ll, 100ll)) + rjust(to_string(safeVal(cpu.cpu_percent, "total"s).back()), 4) + Theme::c("main_fg") + '%';
-			if (show_temps) {
-				const auto [temp, unit] = celsius_to(safeVal(cpu.temp, 0).back(), temp_scale);
-				const auto temp_color = Theme::g("temp").at(clamp(safeVal(cpu.temp, 0).back() * 100 / safe_cpu_temp_max, 0ll, 100ll));
-				if ((b_column_size > 1 or b_columns > 1) and temp_graphs.size() >= 1ll)
-					out += ' ' + Theme::c("inactive_fg") + graph_bg * 5 + Mv::l(5) + temp_color
-						+ temp_graphs.at(0)(safeVal(cpu.temp, 0), data_same or redraw);
-				out += temp_color + rjust(to_string(temp), 4) + Theme::c("main_fg") + unit;
-			}
-
-			if (show_watts) {
-				const auto clamped_watts = clamp(cpu.usage_watts, 0.0f, 999.0f);
-				string cwatts = fmt::format(" {:>4.{}f}", clamped_watts, clamped_watts < 9.995f ? 2 : clamped_watts < 99.95f ? 1 : 0);
-				string cwatts_post = "W";
-
-				max_observed_pwr = max(max_observed_pwr, clamped_watts);
-				out += Theme::g("cached").at(clamp(clamped_watts / max_observed_pwr * 100.0f, 0.0f, 100.0f)) + cwatts + Theme::c("main_fg") + cwatts_post;
-			}
-
-				out += Theme::c("div_line") + Symbols::v_line;
 		} catch (const std::exception& e) {
 			throw std::runtime_error("graphs, clock, meter : " + string{e.what()});
 		}
 
-		int max_row = b_height - 3; // Subtracting one extra row for the load average (and power if enabled)
 		int n_gpus_to_show = 0;
 	#ifdef GPU_SUPPORT
 		n_gpus_to_show = show_gpu ? (gpus.size() - (gpu_always ? 0 : Gpu::shown)) : 0;
 	#endif
-		max_row -= n_gpus_to_show;
 
 		auto is_cpu_enabled = [&cpu](const std::int32_t num) -> bool {
 			return !cpu.active_cpus.has_value() || std::ranges::find(cpu.active_cpus.value(), num) != cpu.active_cpus.value().end();
 		};
 
-		//? Core text and graphs
-		int cx = 0, cy = 1, cc = 0, core_width = (b_column_size == 0 ? 2 : 3);
-		if (Shared::coreCount >= 100) core_width++;
-		for (const auto& n : iota(0, Shared::coreCount)) {
-			auto enabled = is_cpu_enabled(n);
-			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c(enabled ? "main_fg" : "inactive_fg") + (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "")
-				+ ljust(to_string(n), core_width);
-			if ((b_column_size > 0 or extra_width > 0) and cmp_less(n, core_graphs.size()))
-				out += Theme::c("inactive_fg") + graph_bg * (5 * b_column_size + extra_width) + Mv::l(5 * b_column_size + extra_width)
-					+ core_graphs.at(n)(safeVal(cpu.core_percent, n), data_same or redraw);
+		const int n_pkg = max(1, (int)pkg_threads.size());
+		//? Vertical layout: meter, per-socket summaries, optional load average and gpu rows, a divider,
+		//? then the dot grid anchored to the bottom of the box (aux rows drop out when space is tight)
+		const int content_rows = b_height - 2;
+		const bool show_aux = (1 + n_pkg + 1 + n_gpus_to_show + grid_rows <= content_rows);
+		const int aux_rows = show_aux ? 1 + n_gpus_to_show : 0;
+		const bool grid_div = (1 + n_pkg + aux_rows + 1 + grid_rows <= content_rows);
+		const int y_grid = b_y + 2 + n_pkg + aux_rows + (grid_div ? 1 : 0);
+		const int grid_rows_drawn = max(0, min(grid_rows, b_y + b_height - 2 - y_grid + 1));
 
-			out += enabled ? Theme::g("cpu").at(clamp(safeVal(cpu.core_percent, n).back(), 0ll, 100ll)) : Theme::c("inactive_fg");
-			out += rjust(to_string(safeVal(cpu.core_percent, n).back()), (b_column_size < 2 ? 3 : 4)) + Theme::c(enabled ? "main_fg" : "inactive_fg") + '%';
+		//? Per-socket frequency, temperature and power draw (directly under the total meter)
+		try {
+			const int avail = b_width - 2;
+			for (const int& p : iota(0, n_pkg)) {
+				const int row_y = b_y + 2 + p;
+				if (row_y > b_y + b_height - 2) break;
+				out += Mv::to(row_y, b_x + 1) + Theme::c("main_fg") + Fx::b + "P" + to_string(p) + Fx::ub;
+				int used = 2 + (int)to_string(p).size();
 
-			if (show_temps and not hide_cores) {
-				const auto core_temps = safeVal(cpu.temp, n + 1);
-				if (!core_temps.empty()) {
-					// FIXME: This should be checked during collection and just not be made available with
-					// something like `std::nullopt`.
-					const auto last_temp = core_temps.back();
-					const auto [temp, unit] = celsius_to(last_temp, temp_scale);
-					const auto temp_color = enabled ? Theme::g("temp").at(clamp(last_temp * 100 / safe_cpu_temp_max, 0ll, 100ll)) : Theme::c("inactive_fg");
-					if (b_column_size > 1 and std::cmp_greater_equal(temp_graphs.size(), n)) {
-						fmt::format_to(
-							std::back_inserter(out),
-							" {}{}{}{}", Theme::c("inactive_fg"),
-							graph_bg * 5, Mv::l(5),
-							temp_graphs.at(n + 1)(core_temps, data_same || redraw)
-						);
+				//? Frequency
+				string freq;
+				if (Config::getB("show_cpu_freq")) {
+					if (cmp_less(p, pkg_cpuHz.size()) and not pkg_cpuHz.at(p).empty())
+						freq = pkg_cpuHz.at(p);
+					else if (n_pkg == 1 and not cpuHz.empty())
+						freq = cpuHz;
+				}
+				if (not freq.empty() and used + 1 + (int)freq.size() <= avail) {
+					out += ' ' + Theme::c("main_fg") + freq;
+					used += 1 + (int)freq.size();
+				}
+
+				//? Temperature: highest of the core sensors belonging to this socket
+				if (show_temps) {
+					long long pkg_temp = -1;
+					if (Config::getB("show_coretemp") and not cpu_temp_only and not thread_to_pkg.empty() and cmp_less(p, (int)pkg_threads.size())) {
+						for (const auto& t : pkg_threads.at(p)) {
+							if (not safeVal(cpu.temp, t + 1).empty())
+								pkg_temp = max(pkg_temp, safeVal(cpu.temp, t + 1).back());
+						}
 					}
-					fmt::format_to(
-						std::back_inserter(out),
-						"{}{}{}{}",
-						temp_color,
-						rjust(std::to_string(temp), 4),
-						Theme::c(enabled ? "main_fg" : "inactive_fg"),
-						unit
-					);
+					if (pkg_temp < 0 and p == 0) {
+						if (not safeVal(cpu.temp, 0).empty())
+							pkg_temp = safeVal(cpu.temp, 0).back();
+					}
+					if (pkg_temp >= 0 and used + 5 <= avail) {
+						const auto [temp, unit] = celsius_to(pkg_temp, temp_scale);
+						out += ' ' + Theme::g("temp").at(clamp(pkg_temp * 100 / safe_cpu_temp_max, 0ll, 100ll))
+							+ rjust(to_string(temp), 4) + Theme::c("main_fg") + unit;
+						used += 5;
+					}
+				}
+
+				//? Power draw
+				if (show_watts) {
+					float pkg_w = -1.0f;
+					if (cmp_less(p, pkg_watts.size()))
+						pkg_w = pkg_watts.at(p);
+					else if (n_pkg == 1)
+						pkg_w = cpu.usage_watts;
+					if (pkg_w >= 0.0f and used + 6 <= avail) {
+						const auto clamped_watts = clamp(pkg_w, 0.0f, 999.0f);
+						max_observed_pwr = max(max_observed_pwr, clamped_watts);
+						out += Theme::g("cached").at(clamp(clamped_watts / max_observed_pwr * 100.0f, 0.0f, 100.0f))
+							+ fmt::format(" {:>4.{}f}", clamped_watts, clamped_watts < 9.995f ? 2 : clamped_watts < 99.95f ? 1 : 0)
+							+ Theme::c("main_fg") + 'W';
+						used += 6;
+					}
+				}
+
+				if (used < avail)
+					out += Fx::ub + string(avail - used, ' ');
+			}
+		} catch (const std::exception& e) {
+			throw std::runtime_error("socket summary : " + string{e.what()});
+		}
+
+		//? Per-thread utilization as a grid of graph dots: threads sharing a physical core are adjacent,
+		//? ordered by core id, with a separate grid for each socket divided by a vertical line
+		try {
+			const int grid_avail = b_width - 2;
+			std::map<int, vector<std::array<int, 2>>> grid_rows_cells; //? {row, {thread, column}}
+			for (const auto& cell : dot_cells)
+				grid_rows_cells[cell[1]].push_back({cell[0], cell[2]});
+
+			for (const auto& [gy, cells] : grid_rows_cells) {
+				if (gy >= grid_rows_drawn) continue;
+				out += Mv::to(y_grid + gy, b_x + 1);
+				int cur_col = 0;
+				for (const auto& [thread, gc] : cells) {
+					if (gc > cur_col)
+						out += string(gc - cur_col, ' ');
+					const long long util = safeVal(cpu.core_percent, thread).empty() ? 0 : safeVal(cpu.core_percent, thread).back();
+					out += (is_cpu_enabled(thread) ? Theme::g("cpu").at(clamp(util, 0ll, 100ll)) : Theme::c("inactive_fg")) + thread_dot;
+					cur_col = gc + 1;
+				}
+				if (cur_col < grid_avail)
+					out += Fx::ub + string(grid_avail - cur_col, ' ');
+			}
+
+			//? Draw the vertical line separating socket grids
+			if (n_pkg > 1) {
+				for (const int& gy : iota(0, grid_rows_drawn)) {
+					for (int p = 1; p < n_pkg; p++) {
+						const int sep_col = p * (per_socket_width + 1) - 1;
+						if (sep_col < grid_avail)
+							out += Mv::to(y_grid + gy, b_x + 1 + sep_col) + Theme::c("div_line") + Symbols::v_line;
+					}
 				}
 			}
 
-			out += Theme::c("div_line") + Symbols::v_line;
-
-			if ((++cy > ceil((double)Shared::coreCount / b_columns) or cy == max_row) and n != Shared::coreCount - 1) {
-				if (++cc >= b_columns) break;
-				cy = 1; cx = (b_width / b_columns) * cc;
-			}
+			//? Horizontal divider above the grid (skipped when space is tight)
+			if (grid_div)
+				out += Mv::to(y_grid - 1, b_x + 1) + Theme::c("div_line") + Symbols::h_line * grid_avail;
+		} catch (const std::exception& e) {
+			throw std::runtime_error("core dot grid : " + string{e.what()});
 		}
 
 		//? Load average
-		if (cy < b_height - 1 and cc <= b_columns) {
-			cy = b_height - 2 - n_gpus_to_show;
+		{
+			const int cy = b_y + 2 + n_pkg;
+			if (show_aux) {
+				string load_avg_pre = "Load avg:";
+				string load_avg;
 
-			string load_avg_pre = "Load avg:";
-			string load_avg;
+				for (const auto& val : cpu.load_avg) {
+					load_avg += fmt::format(" {:.2f}", val);
+				}
 
-			for (const auto& val : cpu.load_avg) {
-				load_avg += fmt::format(" {:.2f}", val);
+				int len = load_avg_pre.size() + load_avg.size();
+				out += Mv::to(cy, b_x + 1) + string(max(b_width - len - 2, 0), ' ') + Theme::c("main_fg") + Fx::b + load_avg_pre + Fx::ub + load_avg;
 			}
-
-			int len = load_avg_pre.size() + load_avg.size();
-			out += Mv::to(b_y + cy, b_x + 1) + string(max(b_width - len - 2, 0), ' ') + Theme::c("main_fg") + Fx::b + load_avg_pre + Fx::ub + load_avg;
 		}
 
 	#ifdef GPU_SUPPORT
 		//? Gpu brief info
-		if (show_gpu) {
+		if (show_gpu and show_aux) {
+			unsigned long gpu_row = 0;
 			for (unsigned long i = 0; i < gpus.size(); ++i) {
 				if (gpu_auto and v_contains(Gpu::shown_panels, i))
 					continue;
-				out += Mv::to(b_y + ++cy, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
+				const int gpu_y = b_y + 3 + n_pkg + (int)gpu_row;
+				if (gpu_y > b_y + b_height - 2 - grid_rows_drawn - (grid_div ? 1 : 0)) break;
+				out += Mv::to(gpu_y, b_x + 1) + Theme::c("main_fg") + Fx::b + "GPU";
 				if (gpus.size() > 1) out += rjust(to_string(i), 1 + (gpus.size() > 9));
 				if (gpus[i].supported_functions.gpu_utilization) {
 					out += ' ';
-					if (b_columns > 1) {
+					if (b_wide) {
 					out += gpu_meters[i](safeVal(gpus[i].gpu_percent, "gpu-totals"s).back())
 						+ Theme::g("cpu").at(clamp(safeVal(gpus[i].gpu_percent, "gpu-totals"s).back(), 0ll, 100ll));
 					}
 					out += rjust(to_string(safeVal(gpus[i].gpu_percent, "gpu-totals"s).back()), 3) + Theme::c("main_fg") + '%';
-					if (b_columns == 1)
+					if (not b_wide)
 						out += ' ';
 				}
-				if (gpus[i].supported_functions.mem_used and gpus[i].supported_functions.mem_total and b_columns > 1) {
+				if (gpus[i].supported_functions.mem_used and gpus[i].supported_functions.mem_total and b_wide) {
 					out += ' ' + Theme::c("inactive_fg") + graph_bg * 5 + Mv::l(5) + Theme::g("used").at(safeVal(gpus[i].gpu_percent, "gpu-vram-totals"s).back())
 						+ gpu_mem_graphs[i](safeVal(gpus[i].gpu_percent, "gpu-vram-totals"s), data_same or redraw);
 				}
@@ -978,7 +1005,7 @@ namespace Cpu {
 				if (show_temps and gpus[i].supported_functions.temp_info) {
 					const auto [temp, unit] = celsius_to(gpus[i].temp.back(), temp_scale);
 					out += ' ';
-					if (b_columns > 1)
+					if (b_wide)
 						out += Theme::c("inactive_fg") + graph_bg * 5 + Mv::l(5) + Theme::g("temp").at(clamp(gpus[i].temp.back() * 100 / gpus[i].temp_max, 0ll, 100ll))
 							+ gpu_temp_graphs[i](gpus[i].temp, data_same or redraw);
 					else out += Theme::g("temp").at(clamp(gpus[i].temp.back() * 100 / gpus[i].temp_max, 0ll, 100ll));
@@ -989,7 +1016,8 @@ namespace Cpu {
 						+ fmt::format("{:>4.{}f}", gpus[i].pwr_usage / 1000.0, gpus[i].pwr_usage < 10'000 ? 2 : gpus[i].pwr_usage < 100'000 ? 1 : 0) + Theme::c("main_fg") + 'W';
 				}
 
-				if (cy > b_height - 1) break;
+				++gpu_row;
+				if (static_cast<int>(gpu_row) >= n_gpus_to_show) break;
 			}
 		}
 	#endif
@@ -2300,6 +2328,8 @@ namespace Draw {
 				Config::getS("show_gpu_info") == "On" ? Gpu::count
 				: Config::getS("show_gpu_info") == "Auto" ? Gpu::count - Gpu::shown
 				: 0;
+		#else
+			const int gpus_extra_height = 0;
 		#endif
             const bool show_temp = (Config::getB("check_temp") and got_sensors);
 			width = round((double)Term::width * width_p / 100);
@@ -2316,34 +2346,116 @@ namespace Draw {
 			x = 1;
 			y = cpu_bottom ? Term::height - height + 1 : 1;
 
-		#ifdef GPU_SUPPORT
-			b_columns = max(2, (int)ceil((double)(Shared::coreCount + 1) / (height - gpus_extra_height - 5)));
-		#else
-			b_columns = max(1, (int)ceil((double)(Shared::coreCount + 1) / (height - 5)));
-		#endif
-			if (b_columns * (21 + 12 * show_temp) < width - (width / 3)) {
-				b_column_size = 2;
-				b_width =  max(29, (21 + 12 * show_temp) * b_columns - (b_columns - 1));
-			}
-			else if (b_columns * (15 + 6 * show_temp) < width - (width / 3)) {
-				b_column_size = 1;
-				b_width = (15 + 6 * show_temp) * b_columns - (b_columns - 1);
-			}
-			else if (b_columns * (8 + 6 * show_temp) < width - (width / 3)) {
-				b_column_size = 0;
+		//? Layout of the per-thread dot grid in the right-hand box
+		{
+			pkg_threads.clear();
+			const auto core_of = [](const int t) {
+				return cmp_less(t, (int)thread_to_core.size()) ? thread_to_core.at(t) : t;
+			};
+			if (thread_to_pkg.empty()) {
+				//? No topology information: one grid, every thread is its own "core"
+				pkg_threads.resize(1);
+				for (const int& t : iota(0, (int)Shared::coreCount))
+					pkg_threads[0].push_back(t);
 			}
 			else {
-				b_columns = (width - width / 3) / (8 + 6 * show_temp);
-				b_column_size = 0;
+				int max_idx = 0;
+				for (const auto& p : thread_to_pkg) max_idx = max(max_idx, p);
+				pkg_threads.resize(max_idx + 1);
+				for (const int& t : iota(0, (int)Shared::coreCount))
+					pkg_threads[thread_to_pkg.at(t)].push_back(t);
+				//? Sort so threads on the same physical core are adjacent, ordered by core number
+				for (auto& plist : pkg_threads)
+					rng::sort(plist, [&](const int a, const int b) {
+						return core_of(a) != core_of(b) ? core_of(a) < core_of(b) : a < b;
+					});
 			}
 
-			if (b_column_size == 0) b_width = (8 + 6 * show_temp) * b_columns + 1;
-		#ifdef GPU_SUPPORT
-			//gpus_extra_height = max(0, gpus_extra_height - 1);
-			b_height = min(height - 2, (int)ceil((double)Shared::coreCount / b_columns) + 4 + gpus_extra_height);
-		#else
-			b_height = min(height - 2, (int)ceil((double)Shared::coreCount / b_columns) + 4);
-		#endif
+			//? Longest run of sibling threads on a single core
+			threads_per_core = 1;
+			for (const auto& plist : pkg_threads) {
+				int run = 1;
+				for (size_t i = 1; i < plist.size(); i++) {
+					run = core_of(plist[i]) == core_of(plist[i - 1]) ? run + 1 : 1;
+					threads_per_core = max(threads_per_core, run);
+				}
+			}
+		}
+
+		const int n_pkg = max(1, (int)pkg_threads.size());
+		int max_threads = 1;
+		for (const auto& plist : pkg_threads) max_threads = max(max_threads, (int)plist.size());
+
+		//? Max grid rows: box content rows minus borders, meter, per-socket summary rows and the load
+		//? average row. The optional divider (and on very short panels the load average too) degrade first.
+		const int grid_budget = max(1, height - 6 - n_pkg - gpus_extra_height);
+		const int max_b_width = max(24, width - (width / 3));
+		const auto tpc = threads_per_core;
+		//? Character width of a row with <dots> threads, with a space between cores
+		const auto dots_to_chars = [tpc](const int dots) { return dots + max(0, (dots + tpc - 1) / tpc - 1); };
+		//? Largest number of dots fitting in <chars> columns
+		const auto chars_to_dots = [&](const int chars) {
+			if (chars <= 0) return 0;
+			int dots = min(chars, chars * tpc / max(1, tpc + 1));
+			while (dots_to_chars(dots + 1) <= chars) dots++;
+			return max(dots, 1);
+		};
+
+		//? Fit every thread inside the row budget, but keep a reasonably square grid
+		int dots_per_row = clamp(max((int)ceil((double)max_threads / grid_budget), min(12, max_threads)), 1, max_threads);
+		int cap_chars = max(1, (max_b_width - 2 - (n_pkg - 1)) / n_pkg);
+		dots_per_row = min(dots_per_row, max(1, chars_to_dots(cap_chars)));
+		per_socket_width = dots_to_chars(dots_per_row);
+		int summary_min_w = show_temp ? 24 : 20;
+	#ifdef GPU_SUPPORT
+		//? Inline gpu summary rows need a wider box
+		if (Gpu::count > 0 and Config::getS("show_gpu_info") != "Off")
+			summary_min_w = max(summary_min_w, 45);
+	#endif
+		b_width = clamp(n_pkg * per_socket_width + (n_pkg - 1) + 2, summary_min_w, max_b_width);
+		//? Let the dots use the final box width
+		per_socket_width = max(1, (b_width - 2 - (n_pkg - 1)) / n_pkg);
+		dots_per_row = min(max_threads, chars_to_dots(per_socket_width));
+
+		//? Place every thread dot at its (row, column) inside the grid area
+		dot_cells.clear();
+		grid_rows = 0;
+		{
+			const auto core_of = [](const int t) {
+				return cmp_less(t, (int)thread_to_core.size()) ? thread_to_core.at(t) : t;
+			};
+			for (const int& p : iota(0, n_pkg)) {
+				const auto& plist = pkg_threads.at(p);
+				const int x_base = p * (per_socket_width + 1);
+				int x = x_base, row = 0;
+				bool first_in_row = true;
+				for (size_t i = 0; i < plist.size(); i++) {
+					const int core = core_of(plist.at(i));
+					size_t j = i;
+					while (j < plist.size() and core_of(plist.at(j)) == core) j++;
+					const int group = min((int)(j - i), per_socket_width);
+					if (not first_in_row and x + 1 + group - 1 > x_base + per_socket_width - 1) {
+						row++;
+						x = x_base;
+						first_in_row = true;
+					}
+					if (row >= grid_budget or (not first_in_row and x + group > x_base + per_socket_width)) break;
+					if (not first_in_row) x++;
+					for (const int& k : iota(0, group))
+						dot_cells.push_back({plist.at(i + k), row, x++});
+					first_in_row = false;
+					i = j - 1;
+				}
+				grid_rows = max(grid_rows, min(row + 1, grid_budget));
+			}
+			grid_rows = max(1, grid_rows);
+		}
+
+		//? Include a divider row between grid and summaries only when it fully fits
+		const bool grid_div = (height - 2) >= grid_rows + n_pkg + 5 + gpus_extra_height;
+		b_height = min(height - 2, grid_rows + n_pkg + (grid_div ? 5 : 4) + gpus_extra_height);
+		//? On clipped panels, drop grid rows that no longer fit (extra cells are not drawn; the load average yields to the grid)
+		grid_rows = max(1, min(grid_rows, b_height - 3 - n_pkg - gpus_extra_height));
 
 			b_x = x + width - b_width - 1;
 			b_y = y + ceil((double)(height - 2) / 2) - ceil((double)b_height / 2) + 1;
@@ -2351,16 +2463,8 @@ namespace Draw {
 			box = createBox(x, y, width, height, Theme::c("cpu_box"), true, (cpu_bottom ? "" : "cpu"), (cpu_bottom ? "cpu" : ""), 1);
 
 			auto& custom = Config::getS("custom_cpu_name");
-			static const bool hasCpuHz = not Cpu::get_cpuHz().empty();
-		#ifdef __linux__
-			static const bool freq_range = Config::getS("freq_mode") == "range";
-		#else
-			static const bool freq_range = false;
-		#endif
-			const string cpu_title = uresize(
-					(custom.empty() ? Cpu::cpuName : custom),
-					b_width - (Config::getB("show_cpu_freq") and hasCpuHz ? (freq_range ? 24 : 14) : 5)
-			);
+			//? Frequency is shown per socket inside the box, no chip in the title
+			const string cpu_title = uresize((custom.empty() ? Cpu::cpuName : custom), b_width - 5);
 			box += createBox(b_x, b_y, b_width, b_height, "", false, cpu_title);
 		}
 

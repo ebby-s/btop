@@ -35,6 +35,11 @@ using namespace Tools;
 namespace Cpu {
     std::optional<std::string> container_engine;
 
+	vector<int> thread_to_pkg;
+	vector<int> thread_to_core;
+	vector<string> pkg_cpuHz;
+	vector<float> pkg_watts;
+
 	string trim_name(string name) {
 		auto name_vec = ssplit(name);
 

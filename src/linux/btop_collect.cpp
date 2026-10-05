@@ -24,6 +24,7 @@ tab-size = 4
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -146,8 +147,7 @@ struct join_thread
 namespace Cpu {
 	vector<long long> core_old_totals;
 	vector<long long> core_old_idles;
-	//* Per physical package (socket) utilization tracking
-	vector<int> core_to_pkg;
+	//* Per physical package (socket) utilization tracking (thread_to_pkg defined in btop_shared.cpp)
 	vector<long long> pkg_delta_totals;
 	vector<long long> pkg_delta_idles;
 	vector<fs::path> core_freq;
@@ -650,58 +650,94 @@ namespace Cpu {
 		return str;
 	}
 
+	//* Resolve which physical package owns a cpufreq policy device
+	int get_policy_pkg(const fs::path& policy_path) {
+		if (thread_to_pkg.empty()) return 0;
+		static std::unordered_map<string, int> cache;
+		const string key = policy_path.string();
+		if (auto it = cache.find(key); it != cache.end()) return it->second;
+		int pkg = 0;
+		ifstream affected(policy_path.parent_path() / "affected_cpus");
+		int cpu = -1;
+		if (affected >> cpu and cmp_less(cpu, (int)thread_to_pkg.size()) and thread_to_pkg.at(cpu) >= 0)
+			pkg = thread_to_pkg.at(cpu);
+		cache[key] = pkg;
+		return pkg;
+	}
+
 	string get_cpuHz() {
 		static int failed{};
 
-		if (failed > 4)
+		if (failed > 4) {
+			pkg_cpuHz.clear();
 			return ""s;
+		}
 
 		string cpuhz;
 
 		const auto &freq_mode = Config::getS("freq_mode");
 
 		try {
-			double hz = 0.0;
-			// Read frequencies from all CPU cores
+			//? Read frequencies from all CPU cores, grouped by physical package
 			vector<double> frequencies;
+			std::map<int, vector<double>> pkg_frequencies;
 			for (auto it = Cpu::core_freq.begin(); it != Cpu::core_freq.end(); ) {
-    			if (it->empty()) {
-        			it = Cpu::core_freq.erase(it);
-        			continue;
-    			}
+				if (it->empty()) {
+					it = Cpu::core_freq.erase(it);
+					continue;
+				}
 
-    			double core_hz = stod(readfile(*it, "0.0")) / 1000;
-    			if (core_hz <= 0.0 and ++failed >= 2) {
-        			it = Cpu::core_freq.erase(it);
-    			} else {
-        			frequencies.push_back(core_hz);
-        			if (freq_mode == "first") break;
-        			++it;
-    			}
- 			}
+				double core_hz = stod(readfile(*it, "0.0")) / 1000;
+				if (core_hz <= 0.0 and ++failed >= 2) {
+					it = Cpu::core_freq.erase(it);
+				} else {
+					frequencies.push_back(core_hz);
+					pkg_frequencies[get_policy_pkg(*it)].push_back(core_hz);
+					++it;
+				}
+			}
 
-			if (not frequencies.empty()) {
-				if (freq_mode == "first") {
-					hz = frequencies.front();
-				}
-				if (freq_mode == "average") {
-					hz = std::accumulate(frequencies.begin(), frequencies.end(), 0.0) / static_cast<double>(frequencies.size());
-				}
-				else if (freq_mode == "highest") {
-					hz = *std::max_element(frequencies.begin(), frequencies.end());
-				}
-				else if (freq_mode == "lowest") {
-					hz = *std::min_element(frequencies.begin(), frequencies.end());
-				}
+			//? Summarize a set of core frequencies according to the freq_mode setting
+			auto select_hz = [&](const vector<double>& freqs) -> string {
+				if (freqs.empty()) return ""s;
+				if (freq_mode == "average")
+					return normalize_frequency(std::accumulate(freqs.begin(), freqs.end(), 0.0) / static_cast<double>(freqs.size()));
+				else if (freq_mode == "highest")
+					return normalize_frequency(*std::max_element(freqs.begin(), freqs.end()));
+				else if (freq_mode == "lowest")
+					return normalize_frequency(*std::min_element(freqs.begin(), freqs.end()));
 				else if (freq_mode == "range") {
-					auto [min_hz,max_hz] = std::minmax_element(frequencies.begin(), frequencies.end());
+					auto [min_hz, max_hz] = std::minmax_element(freqs.begin(), freqs.end());
+					return normalize_frequency(*min_hz) + " - " + normalize_frequency(*max_hz);
+				}
+				//? "first" and any unknown mode
+				return normalize_frequency(freqs.front());
+			};
 
-					// Format as range
-					string min_str, max_str;
-					min_str = normalize_frequency(*min_hz);
-					max_str = normalize_frequency(*max_hz);
+			//? Per-socket frequency strings, indexed by package id
+			pkg_cpuHz.clear();
+			if (not pkg_frequencies.empty()) {
+				const int max_pkg = pkg_frequencies.rbegin()->first;
+				for (int p = 0; p <= max_pkg; p++)
+					pkg_cpuHz.push_back(pkg_frequencies.contains(p) ? select_hz(pkg_frequencies.at(p)) : ""s);
+			}
 
-					return min_str + " - " + max_str;
+			double hz = 0.0;
+			if (not frequencies.empty()) {
+				if (freq_mode == "range") {
+					//? Range formatting needs both endpoints, cannot be represented as a single value
+					cpuhz = select_hz(frequencies);
+					hz = 1000; //? Nonzero so the cpuinfo fallback is skipped
+				}
+				else {
+					if (freq_mode == "average")
+						hz = std::accumulate(frequencies.begin(), frequencies.end(), 0.0) / static_cast<double>(frequencies.size());
+					else if (freq_mode == "highest")
+						hz = *std::max_element(frequencies.begin(), frequencies.end());
+					else if (freq_mode == "lowest")
+						hz = *std::min_element(frequencies.begin(), frequencies.end());
+					else
+						hz = frequencies.front(); //? "first" and any unknown mode
 				}
 			}
 			//? If freq from /sys failed or is missing try to use /proc/cpuinfo
@@ -726,10 +762,12 @@ namespace Cpu {
 			if (hz <= 1 or hz >= 999999999)
 				throw std::runtime_error("Failed to read /sys/devices/system/cpu/cpufreq/policy and /proc/cpuinfo.");
 
-			cpuhz = normalize_frequency(hz);
+			if (cpuhz.empty())
+				cpuhz = normalize_frequency(hz);
 
 		}
 		catch (const std::exception& e) {
+			pkg_cpuHz.clear();
 			if (++failed < 5)
 				return ""s;
 			else {
@@ -1013,6 +1051,9 @@ namespace Cpu {
 		return {percent, watts, seconds, status};
 	}
 
+	//? Accumulated (wrap-corrected) energy per RAPL package domain, indexed by package id
+	vector<long long> pkg_energy_cumulative;
+
 	long long get_cpuConsumptionUJoules()
 	{
 		//? Sum the accumulated package energy across ALL intel-rapl package
@@ -1055,6 +1096,16 @@ namespace Cpu {
 					if (delta < 0) delta += max_range;
 					cumulative += delta;
 					prev[key] = energy;
+
+					//? Track the same delta per package domain for per-socket power draw
+					int pkg_idx = 0;
+					if (const auto dash = name.find('-'); dash != std::string::npos) {
+						try { pkg_idx = std::stoi(name.substr(dash + 1)); }
+						catch (...) { pkg_idx = 0; }
+					}
+					if (cmp_less(pkg_energy_cumulative.size(), (size_t)pkg_idx + 1))
+						pkg_energy_cumulative.resize((size_t)pkg_idx + 1, 0);
+					pkg_energy_cumulative.at(pkg_idx) += delta;
 				}
 			} catch (...) { }
 		}
@@ -1066,11 +1117,13 @@ namespace Cpu {
 	{
 		static long long previous_usage = 0;
 		static long long previous_timestamp = 0;
+		static vector<long long> previous_pkg_energy;
 
 		if (previous_usage == 0)
 		{
 			previous_usage = get_cpuConsumptionUJoules();
 			previous_timestamp = get_monotonicTimeUSec();
+			previous_pkg_energy = pkg_energy_cumulative;
 			supports_watts = rapl_ok;
 			return 0;
 		}
@@ -1083,10 +1136,20 @@ namespace Cpu {
 		auto current_timestamp = get_monotonicTimeUSec();
 		auto current_usage = get_cpuConsumptionUJoules();
 
-		auto watts = (float)(current_usage - previous_usage) / (float)(current_timestamp - previous_timestamp);
+		auto elapsed = static_cast<float>(current_timestamp - previous_timestamp);
+		if (elapsed <= 0) elapsed = 1;
+		auto watts = (float)(current_usage - previous_usage) / elapsed;
+
+		//? Per-socket power draw from the individual RAPL package domains
+		pkg_watts.assign(pkg_energy_cumulative.size(), 0.0f);
+		for (size_t p = 0; p < pkg_energy_cumulative.size(); p++) {
+			const long long old_energy = cmp_less(p, previous_pkg_energy.size()) ? previous_pkg_energy.at(p) : 0;
+			pkg_watts.at(p) = (float)(pkg_energy_cumulative.at(p) - old_energy) / elapsed;
+		}
 
 		previous_timestamp = current_timestamp;
 		previous_usage = current_usage;
+		previous_pkg_energy = pkg_energy_cumulative;
 
 		return watts;
 	}
@@ -1124,19 +1187,26 @@ namespace Cpu {
 
 	//* Build core -> physical package (socket) mapping from sysfs
 	auto get_pkg_mapping() {
-		core_to_pkg.clear();
+		thread_to_pkg.clear();
+		thread_to_core.clear();
 		for (int c = 0; c < Shared::coreCount; c++) {
-			ifstream pkg_file("/sys/devices/system/cpu/cpu" + to_string(c) + "/topology/physical_package_id");
+			const auto cpu_path = fs::path("/sys/devices/system/cpu/cpu" + to_string(c) + "/topology");
+			ifstream pkg_file(cpu_path / "physical_package_id");
 			int pkg = -1;
 			pkg_file >> pkg;
 			if (not pkg_file or pkg < 0) {
-				core_to_pkg.clear();
+				thread_to_pkg.clear();
+				thread_to_core.clear();
 				return;
 			}
-			core_to_pkg.push_back(pkg);
+			ifstream core_file(cpu_path / "core_id");
+			int core = -1;
+			core_file >> core;
+			thread_to_pkg.push_back(pkg);
+			thread_to_core.push_back(core < 0 ? c : core);
 		}
-		if (not core_to_pkg.empty()) {
-			const int max_pkg = *max_element(core_to_pkg.begin(), core_to_pkg.end());
+		if (not thread_to_pkg.empty()) {
+			const int max_pkg = *max_element(thread_to_pkg.begin(), thread_to_pkg.end());
 			while (cmp_less(pkg_delta_totals.size(), (size_t)max_pkg + 1)) {
 				pkg_delta_totals.push_back(0);
 				pkg_delta_idles.push_back(0);
@@ -1148,7 +1218,7 @@ namespace Cpu {
 		if (Runner::stopping or (no_update and not current_cpu.cpu_percent.at("total").empty())) return current_cpu;
 		auto& cpu = current_cpu;
 
-		if (core_to_pkg.size() != (size_t)Shared::coreCount)
+		if (thread_to_pkg.size() != (size_t)Shared::coreCount)
 			get_pkg_mapping();
 
 		if (Config::getB("show_cpu_freq"))
@@ -1258,8 +1328,8 @@ namespace Cpu {
 						cpu.core_percent.at(i-1).push_back(clamp((long long)round((double)(calc_totals - calc_idles) * 100 / calc_totals), 0ll, 100ll));
 
 						//? Accumulate core deltas into its physical package (socket)
-						if (not core_to_pkg.empty() and cmp_less(i - 1, (int)core_to_pkg.size())) {
-							const int pkg = core_to_pkg.at(i - 1);
+						if (not thread_to_pkg.empty() and cmp_less(i - 1, (int)thread_to_pkg.size())) {
+							const int pkg = thread_to_pkg.at(i - 1);
 							if (pkg < (int)pkg_delta_totals.size()) {
 								pkg_delta_totals.at(pkg) += calc_totals;
 								pkg_delta_idles.at(pkg) += calc_idles;
@@ -1281,7 +1351,7 @@ namespace Cpu {
 			}
 
 			//? Calculate utilization for each physical package (socket)
-			if (not core_to_pkg.empty()) {
+			if (not thread_to_pkg.empty()) {
 				for (size_t p = 0; p < pkg_delta_totals.size(); p++) {
 					const long long calc_totals = max(1ll, pkg_delta_totals.at(p));
 					const long long calc_idles = max(0ll, pkg_delta_idles.at(p));

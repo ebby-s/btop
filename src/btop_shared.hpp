@@ -208,6 +208,12 @@ namespace Cpu {
 	extern tuple<int, float, long, string> current_bat;
 	extern std::optional<std::string> container_engine;
 
+	//* Per-socket/thread topology (empty on platforms without topology support)
+	extern vector<int> thread_to_pkg;   //? Socket (physical package) id for each logical cpu
+	extern vector<int> thread_to_core;  //? Physical core id for each logical cpu
+	extern vector<string> pkg_cpuHz;    //? Frequency display string per socket
+	extern vector<float> pkg_watts;     //? Power draw in watts per socket
+
 	struct cpu_info {
 		std::unordered_map<string, deque<long long>> cpu_percent = {
 			{"total", {}},
