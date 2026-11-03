@@ -182,6 +182,7 @@ namespace Menu {
 		{"3", "Toggle NET box."},
 		{"4", "Toggle PROC box."},
 		{"5", "Toggle GPU box."},
+		{"v", "Toggle COMPUTE box (replaces cpu/gpu)."},
 		{"d", "Toggle disks view in MEM box."},
 		{"F2, o", "Shows options."},
 		{"F1, ?, h", "Shows this window."},
@@ -296,7 +297,9 @@ namespace Menu {
 			{"shown_boxes",
 				"Manually set which boxes to show.",
 				"",
-				"Available values are \"cpu mem net proc\".",
+				"Available values are \"cpu mem net proc compute\".",
+				"\"compute\" shows sockets and GPUs as linked",
+				"device boxes (replaces the cpu/gpu panels).",
 			#ifdef GPU_SUPPORT
 				"Or \"gpu0\" through \"gpu5\" for GPU boxes.",
 			#endif
@@ -573,6 +576,22 @@ namespace Menu {
 				"`make setuid` or running with sudo.",
 				"",
 				"True or False."},
+#ifdef GPU_SUPPORT
+			{"compute_top_procs",
+				"Number of top processes shown in each",
+				"compute panel device box (sockets and GPUs).",
+				"",
+				"Socket processes are attributed by the CPU",
+				"they last ran on.",
+				"",
+				"Min value: 0",
+				"Max value: 10."},
+			{"compute_show_links",
+				"Show the PCIe/UPI/QPI connection lines",
+				"between compute panel devices.",
+				"",
+				"True or False."},
+#endif // GPU_SUPPORT
 		},
 	#ifdef GPU_SUPPORT
 		{
@@ -1487,8 +1506,10 @@ static int optionsMenu(const string& key) {
 				if (key == "right" or (vim_keys and key == "l")) value += mod;
 				else value -= mod;
 
-				if (Config::intValid(option, to_string(value)))
+				if (Config::intValid(option, to_string(value))) {
 					Config::set(option, static_cast<int>(value));
+					if (option == "compute_top_procs") screen_redraw = true;
+				}
 				else {
 					warnings = Config::validError;
 				}

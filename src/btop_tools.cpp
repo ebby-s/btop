@@ -118,6 +118,7 @@ namespace Term {
 
 	auto get_min_size(const string& boxes) -> array<int, 2> {
         bool cpu = boxes.find("cpu") != string::npos;
+        bool compute = boxes.find("compute") != string::npos;
         bool mem = boxes.find("mem") != string::npos;
         bool net = boxes.find("net") != string::npos;
         bool proc = boxes.find("proc") != string::npos;
@@ -132,6 +133,7 @@ namespace Term {
 		else if (net) width = Mem::min_width;
 		width += (proc ? Proc::min_width : 0);
 		if (cpu and width < Cpu::min_width) width = Cpu::min_width;
+		if (compute and width < Compute::min_width) width = Compute::min_width;
 	#ifdef GPU_SUPPORT
 		int gpu_cols = 0;
 		if (gpu != 0) {
@@ -140,7 +142,7 @@ namespace Term {
 		}
 	#endif
 
-		int height = (cpu ? Cpu::min_height : 0);
+		int height = (compute ? Compute::min_height : (cpu ? Cpu::min_height : 0));
 		if (proc) height += Proc::min_height;
 		else height += (mem ? Mem::min_height : 0) + (net ? Net::min_height : 0);
 	#ifdef GPU_SUPPORT

@@ -194,6 +194,7 @@ namespace Gpu {
 		#define NVML_TEMPERATURE_GPU                 0
 		#define NVML_PCIE_UTIL_TX_BYTES              0
 		#define NVML_PCIE_UTIL_RX_BYTES              1
+		#define NVML_ERROR_INSUFFICIENT_SIZE         7 //? Count queries answer this with the count set when data exists
 
 		typedef void* nvmlDevice_t; // we won't be accessing any of the underlying struct's properties, so this is fine
 		typedef int nvmlReturn_t, // enums are basically ints
@@ -224,6 +225,29 @@ namespace Gpu {
 		nvmlReturn_t (*nvmlDeviceGetPcieThroughput)(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetEncoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
+
+		//? Topology & per-process structs matching the NVML ABI (layout taken from nvml.h)
+		struct nvmlPciInfo_cur_t {
+			char busIdLegacy[16];
+			unsigned int domain, bus, device, pciDeviceId, pciSubSystemId;
+			char busId[32];
+		};
+		struct nvmlPciInfo_old_t {
+			char busIdStub[64];
+			unsigned int domain, bus, device, pciDeviceId, pciSubSystemId;
+		};
+		struct nvmlProcInfo_v1_t { unsigned int pid; unsigned long long usedGpuMemory; };
+		struct nvmlProcInfo_v2_t { unsigned int pid; unsigned long long usedGpuMemory; unsigned int gpuInstanceId, computeInstanceId; };
+		struct nvmlProcUtil_t { unsigned int pid; unsigned long long timeStamp; unsigned int smUtil, memUtil, encUtil, decUtil; };
+
+		//? Optional symbols for the compute panel (loaded in init(), nullptr when unavailable)
+		nvmlReturn_t (*nvmlDeviceGetPciInfo_v3)(nvmlDevice_t, nvmlPciInfo_cur_t*);
+		nvmlReturn_t (*nvmlDeviceGetPciInfo_old)(nvmlDevice_t, nvmlPciInfo_old_t*);
+		nvmlReturn_t (*nvmlDeviceGetComputeRunningProcesses)(nvmlDevice_t, unsigned int*, nvmlProcInfo_v1_t*);
+		nvmlReturn_t (*nvmlDeviceGetComputeRunningProcesses_v2)(nvmlDevice_t, unsigned int*, nvmlProcInfo_v2_t*);
+		nvmlReturn_t (*nvmlDeviceGetProcessUtilization)(nvmlDevice_t, nvmlProcUtil_t*, unsigned int*, unsigned long long);
+		bool have_procs_v2 = false;
+		bool have_proc_util = false;
 
 		//? Data
 		void* nvml_dl_handle;
@@ -278,6 +302,20 @@ namespace Gpu {
 		rsmi_status_t (*rsmi_dev_memory_usage_get)(uint32_t, rsmi_memory_type_t, uint64_t*);
 		rsmi_status_t (*rsmi_dev_pci_throughput_get)(uint32_t, uint64_t*, uint64_t*, uint64_t*);
 
+		//? Per-process struct matching the RSMI 6+ ABI (layout taken from rocm_smi.h)
+		struct rsmi_proc_info_t {
+			uint32_t process_id, pasid;
+			uint64_t vram_usage, sdma_usage;
+			uint32_t cu_occupancy;
+		};
+
+		//? Optional symbols for the compute panel (loaded in init(), nullptr when unavailable)
+		rsmi_status_t (*rsmi_dev_pci_id_get)(uint32_t, uint64_t*);
+		rsmi_status_t (*rsmi_topo_numa_affinity_get)(uint32_t, int32_t*);
+		rsmi_status_t (*rsmi_compute_process_info_get)(rsmi_proc_info_t*, uint32_t*);
+		rsmi_status_t (*rsmi_compute_process_gpus_get)(uint32_t, uint32_t*, uint32_t*);
+		rsmi_status_t (*rsmi_compute_process_info_by_device_get)(uint32_t, uint32_t, rsmi_proc_info_t*);
+
 		uint32_t version_major = 0;
 
 		//? Data
@@ -327,6 +365,90 @@ namespace Gpu {
 	}
 }
 
+#endif // GPU_SUPPORT
+
+#ifdef GPU_SUPPORT
+namespace Topo {
+	//* Map a PCIe link speed (GT/s) string from sysfs to a PCIe generation
+	static int gt_to_gen(const string& speed) {
+		try {
+			const double gt = stod(speed);
+			if (gt < 3.5) return 1;   //? 2.5 GT/s
+			if (gt < 6.5) return 2;   //? 5.0 GT/s
+			if (gt < 9.5) return 3;   //? 8.0 GT/s
+			if (gt < 17.5) return 4;  //? 16.0 GT/s
+			if (gt < 33.5) return 5;  //? 32.0 GT/s
+			if (gt <= 64.0) return 6; //? 64.0 GT/s
+		}
+		catch (...) {}
+		return 0;
+	}
+
+	//* Read sysfs PCIe link state and NUMA affinity for a GPU with a known BDF
+	static void gpu_sysfs_info(Gpu::gpu_info& g) {
+		if (g.bdf.empty()) return;
+		const fs::path p = fs::path("/sys/bus/pci/devices") / g.bdf;
+		if (not fs::exists(p)) return;
+		if (g.numa_socket < 0) {
+			const string numa = readfile(p / "numa_node", "");
+			if (not numa.empty()) {
+				try { g.numa_socket = stoi(numa); }
+				catch (...) {}
+			}
+		}
+		const string width = readfile(p / "current_link_width", "");
+		if (not width.empty()) {
+			try { g.pcie_width = stoi(width); }
+			catch (...) {}
+		}
+		const string speed = readfile(p / "current_link_speed", "");
+		if (not speed.empty())
+			g.pcie_gen = gt_to_gen(speed);
+	}
+
+	//* Best effort inter-socket link label: dmesg QPI/UPI lines, else CPU vendor guess
+	static void get_socket_link_label() {
+		socket_link_label.clear();
+		if (Cpu::thread_to_pkg.empty()) return;
+		int n_pkg = 1;
+		for (const int p : Cpu::thread_to_pkg) n_pkg = max(n_pkg, p + 1);
+		if (n_pkg < 2) return;
+
+		//? The kernel only prints link info at boot; try the ring buffer first
+		bool found = false;
+		if (auto* stream = popen("dmesg 2>/dev/null | grep -icE 'qpi link|upi link'", "r")) {
+			int links = 0;
+			char buf[32];
+			while (fgets(buf, sizeof buf, stream) != nullptr and links < 64)
+				links++;
+			pclose(stream);
+			if (links > 0) {
+				//? Re-read the first matching line to see if it says QPI or UPI
+				if (auto* s2 = popen("dmesg 2>/dev/null | grep -im1 'qpi link'", "r")) {
+					found = (fgets(buf, sizeof buf, s2) != nullptr);
+					pclose(s2);
+				}
+				socket_link_label = (found ? "QPI" : "UPI");
+				if (links > 1) socket_link_label += " x" + to_string(links);
+			}
+		}
+		if (not socket_link_label.empty()) return;
+
+		//? Fallback: infer the interconnect family from the CPU vendor
+		string vendor;
+		ifstream ci("/proc/cpuinfo");
+		for (string line; ci.good() and getline(ci, line);)
+			if (line.starts_with("vendor_id")) { vendor = line; break; }
+		socket_link_label = (vendor.contains("GenuineIntel") ? "UPI" : "xGMI");
+	}
+
+	void init() {
+		get_socket_link_label();
+		//? Fill in the sysfs based PCIe/NUMA info for every GPU that has a BDF
+		for (auto& g : Gpu::gpus)
+			gpu_sysfs_info(g);
+	}
+}
 #endif // GPU_SUPPORT
 
 namespace Mem {
@@ -429,6 +551,11 @@ namespace Shared {
 					   + (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
 						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
 		}
+	#endif
+
+		//? Init for namespace Topo (GPU -> socket links, inter-socket link label)
+	#ifdef GPU_SUPPORT
+		Topo::init();
 	#endif
 
 		//? Init for namespace Mem
@@ -1238,12 +1365,78 @@ namespace Cpu {
 		}
 	}
 
+	//* Read per-NUMA-node memory and map nodes to sockets by their CPU overlap
+	static void get_numa_mem() {
+		pkg_mem.clear();
+		if (thread_to_pkg.empty() or pkg_delta_totals.empty()) return;
+		const int n_pkg = (int)pkg_delta_totals.size();
+		pkg_mem.resize((size_t)n_pkg);
+		try {
+			for (const auto& d : fs::directory_iterator("/sys/devices/system/node")) {
+				const string fname = d.path().filename();
+				if (not fname.starts_with("node") or fname.size() < 5 or not isdigit(fname.at(4)))
+					continue;
+
+				//? Socket that this node's CPUs belong to (first CPU with a known package)
+				const string cpulist = readfile(d.path() / "cpulist", "");
+				int pkg = -1;
+				for (const auto& range : ssplit(cpulist, ',')) {
+					const auto bounds = ssplit(range, '-');
+					try {
+						const int from = stoi(bounds.at(0));
+						const int to = (bounds.size() > 1 ? stoi(bounds.at(1)) : from);
+						for (int c = min(from, to); c <= max(from, to) and pkg < 0; c++)
+							if (cmp_less(c, (int)thread_to_pkg.size()) and thread_to_pkg.at(c) >= 0)
+								pkg = thread_to_pkg.at(c);
+					}
+					catch (...) { continue; }
+				}
+				if (pkg < 0 or cmp_greater(pkg, n_pkg)) continue;
+
+				//? Parse the node's meminfo (values in kB)
+				uint64_t total = 0, free_ = 0, cached = 0, buffers = 0, available = 0;
+				ifstream mi(d.path() / "meminfo");
+				if (mi.good()) {
+					//? Lines are prefixed with the node name, eg "Node 0 MemTotal:       32848504 kB"
+					string line;
+					while (getline(mi, line)) {
+						const auto toks = ssplit(line, ' ');
+						if (toks.size() < 4) continue;
+						uint64_t val{};
+						try {
+							val = stoull(toks.at(toks.size() - 2));
+						}
+						catch (...) {
+							continue;
+						}
+						const string& key = toks.at(toks.size() - 3);
+						if (key == "MemTotal:") total = val * 1024;
+						else if (key == "MemFree:") free_ = val * 1024;
+						else if (key == "MemAvailable:") available = val * 1024;
+						else if (key == "Cached:") cached = val * 1024;
+						else if (key == "Buffers:") buffers = val * 1024;
+					}
+				}
+				const uint64_t used = (total >= free_ + cached + buffers) ? total - free_ - cached - buffers : 0;
+				auto& m = pkg_mem.at((size_t)pkg);
+				m.total += total;
+				m.available += available;
+				m.used += used;
+			}
+		}
+		catch (...) {
+			pkg_mem.clear();
+		}
+	}
+
 	auto collect(bool no_update) -> cpu_info& {
 		if (Runner::stopping or (no_update and not current_cpu.cpu_percent.at("total").empty())) return current_cpu;
 		auto& cpu = current_cpu;
 
 		if (thread_to_pkg.size() != (size_t)Shared::coreCount)
 			get_pkg_mapping();
+
+		get_numa_mem();
 
 		if (Config::getB("show_cpu_freq"))
 			cpuHz = get_cpuHz();
@@ -1414,6 +1607,10 @@ namespace Cpu {
 
 #ifdef GPU_SUPPORT
 namespace Gpu {
+    //* Read the name of a process for the compute panel lists (empty on failure)
+    static string get_proc_name(const uint32_t pid) {
+        return readfile(Shared::procPath / to_string(pid) / "comm", "");
+    }
     //? NVIDIA
     namespace Nvml {
 		bool init() {
@@ -1467,6 +1664,20 @@ namespace Gpu {
 			LOAD_SYM(nvmlDeviceGetDecoderUtilization);
 
             #undef LOAD_SYM
+
+			//? Optional symbols for the compute panel (not fatal when missing on older libraries)
+			auto opt_nvml_sym = [&](const char* sym_name) {
+				auto sym = dlsym(nvml_dl_handle, sym_name);
+				(void)dlerror(); //? clear error state, missing optional symbols are expected
+				return sym;
+			};
+			nvmlDeviceGetPciInfo_v3 = (decltype(nvmlDeviceGetPciInfo_v3))opt_nvml_sym("nvmlDeviceGetPciInfo_v3");
+			if (nvmlDeviceGetPciInfo_v3 == nullptr)
+				nvmlDeviceGetPciInfo_old = (decltype(nvmlDeviceGetPciInfo_old))opt_nvml_sym("nvmlDeviceGetPciInfo");
+			nvmlDeviceGetComputeRunningProcesses = (decltype(nvmlDeviceGetComputeRunningProcesses))opt_nvml_sym("nvmlDeviceGetComputeRunningProcesses");
+			have_procs_v2 = (nvmlDeviceGetComputeRunningProcesses == nullptr) and
+				(nvmlDeviceGetComputeRunningProcesses_v2 = (decltype(nvmlDeviceGetComputeRunningProcesses_v2))opt_nvml_sym("nvmlDeviceGetComputeRunningProcesses_v2")) != nullptr;
+			have_proc_util = (nvmlDeviceGetProcessUtilization = (decltype(nvmlDeviceGetProcessUtilization))opt_nvml_sym("nvmlDeviceGetProcessUtilization")) != nullptr;
 
 			//? Function calls
 			nvmlReturn_t result = nvmlInit();
@@ -1537,6 +1748,20 @@ namespace Gpu {
 						}
 						gpu_names[i] = trim(gpu_names[i]);
         			}
+
+					//? PCI BDF for the sysfs topology lookup (GPU -> socket, PCIe link state)
+					if (nvmlDeviceGetPciInfo_v3 != nullptr) {
+						nvmlPciInfo_cur_t pci;
+						result = nvmlDeviceGetPciInfo_v3(devices[i], &pci);
+						if (result == NVML_SUCCESS)
+							gpus_slice[i].bdf = fmt::format("{:04x}:{:02x}:{:02x}.0", pci.domain, pci.bus, pci.device);
+					}
+					else if (nvmlDeviceGetPciInfo_old != nullptr) {
+						nvmlPciInfo_old_t pci;
+						result = nvmlDeviceGetPciInfo_old(devices[i], &pci);
+						if (result == NVML_SUCCESS)
+							gpus_slice[i].bdf = fmt::format("{:04x}:{:02x}:{:02x}.0", pci.domain, pci.bus, pci.device);
+					}
 
     				//? Power usage
     				unsigned int max_power;
@@ -1695,16 +1920,63 @@ namespace Gpu {
 					} else gpus_slice[i].decoder_utilization = (long long)utilization;
 				}
 
-    			//? TODO: Processes using GPU
-    				/*unsigned int proc_info_len;
-    				nvmlProcessInfo_t* proc_info = 0;
-    				result = nvmlDeviceGetComputeRunningProcesses_v3(device, &proc_info_len, proc_info);
-    				if (result != NVML_SUCCESS) {
-						Logger::warning("NVML: Failed to get compute processes: {}", nvmlErrorString(result));
-    				} else {
-    					for (unsigned int i = 0; i < proc_info_len; ++i)
-    						gpus_slice[i].graphics_processes.push_back({proc_info[i].pid, proc_info[i].usedGpuMemory});
-    				}*/
+				//? Processes currently using this GPU (compute panel)
+				if constexpr(not is_init) {
+					gpus_slice[i].procs.clear();
+					if (Config::getS("shown_boxes").contains("compute")
+						and (nvmlDeviceGetComputeRunningProcesses != nullptr or have_procs_v2)) {
+						static bool proc_err_logged = false;
+						if (nvmlDeviceGetComputeRunningProcesses != nullptr) {
+							unsigned int count = 0;
+							//? The count query answers INSUFFICIENT_SIZE (count set) when processes are running
+							if ((result = nvmlDeviceGetComputeRunningProcesses(devices[i], &count, nullptr)) == NVML_SUCCESS
+								or result == NVML_ERROR_INSUFFICIENT_SIZE) {
+								if (count > 0 and count < 4096) {
+								vector<nvmlProcInfo_v1_t> infos(count);
+								if (nvmlDeviceGetComputeRunningProcesses(devices[i], &count, infos.data()) == NVML_SUCCESS) {
+									//? Per-process utilization (best effort, recent NVML only)
+									std::unordered_map<uint32_t, double> util;
+									if (have_proc_util) {
+										unsigned int ns = 0;
+										const nvmlReturn_t util_result = nvmlDeviceGetProcessUtilization(devices[i], nullptr, &ns, 0);
+										if ((util_result == NVML_SUCCESS or util_result == NVML_ERROR_INSUFFICIENT_SIZE) and ns > 0 and ns < 4096) {
+											vector<nvmlProcUtil_t> samples(ns);
+											if (nvmlDeviceGetProcessUtilization(devices[i], samples.data(), &ns, 0) == NVML_SUCCESS)
+												for (unsigned int s = 0; s < ns; s++)
+													util[samples[s].pid] = (double)samples[s].smUtil;
+										}
+									}
+									for (unsigned int p = 0; p < count; p++) {
+										auto& pr = gpus_slice[i].procs.emplace_back(infos[p].pid, infos[p].usedGpuMemory,
+											util.contains(infos[p].pid) ? util.at(infos[p].pid) : 0.0);
+										pr.name = get_proc_name(infos[p].pid);
+									}
+								}
+								}
+						}
+						else if (result != NVML_SUCCESS and result != NVML_ERROR_INSUFFICIENT_SIZE and not proc_err_logged) {
+							Logger::info("NVML: not fetching GPU processes: {}", nvmlErrorString(result));
+							proc_err_logged = true;
+						}
+						}
+						else if (have_procs_v2) {
+							unsigned int count = 0;
+							//? The count query answers INSUFFICIENT_SIZE (count set) when processes are running
+							if ((result = nvmlDeviceGetComputeRunningProcesses_v2(devices[i], &count, nullptr)) == NVML_SUCCESS
+								or result == NVML_ERROR_INSUFFICIENT_SIZE) {
+								if (count > 0 and count < 4096) {
+								vector<nvmlProcInfo_v2_t> infos(count);
+								if (nvmlDeviceGetComputeRunningProcesses_v2(devices[i], &count, infos.data()) == NVML_SUCCESS) {
+									for (unsigned int p = 0; p < count; p++) {
+										auto& pr = gpus_slice[i].procs.emplace_back(infos[p].pid, infos[p].usedGpuMemory, 0.0);
+										pr.name = get_proc_name(infos[p].pid);
+									}
+								}
+								}
+							}
+					}
+				}
+			}
 
 				// nvTimer.stop_rename_reset("Nv pcie thread join");
 				//? Join PCIE TX/RX threads
@@ -1821,6 +2093,15 @@ namespace Gpu {
 				return false;
 			}
 			version_major = effective_major;
+
+			//? Optional symbols for the compute panel (not fatal when missing)
+			rsmi_dev_pci_id_get = (decltype(rsmi_dev_pci_id_get))dlsym(rsmi_dl_handle, "rsmi_dev_pci_id_get");
+			rsmi_topo_numa_affinity_get = (decltype(rsmi_topo_numa_affinity_get))dlsym(rsmi_dl_handle, "rsmi_topo_numa_affinity_get");
+			if (effective_major >= 6) {
+				rsmi_compute_process_info_get = (decltype(rsmi_compute_process_info_get))dlsym(rsmi_dl_handle, "rsmi_compute_process_info_get");
+				rsmi_compute_process_gpus_get = (decltype(rsmi_compute_process_gpus_get))dlsym(rsmi_dl_handle, "rsmi_compute_process_gpus_get");
+				rsmi_compute_process_info_by_device_get = (decltype(rsmi_compute_process_info_by_device_get))dlsym(rsmi_dl_handle, "rsmi_compute_process_info_by_device_get");
+			}
 		#endif
 
 			//? Device count
@@ -1889,6 +2170,21 @@ namespace Gpu {
 					//? Disable encoder and decoder utilisation on AMD
 					gpus_slice[i].supported_functions.encoder_utilization = false;
 					gpus_slice[i].supported_functions.decoder_utilization = false;
+
+					//? PCI BDF + NUMA affinity for the sysfs topology lookup (compute panel)
+					#if !defined(RSMI_STATIC)
+						if (rsmi_dev_pci_id_get != nullptr) {
+							uint64_t bdfid = 0;
+							if (rsmi_dev_pci_id_get(i, &bdfid) == RSMI_STATUS_SUCCESS)
+								gpus_slice[i].bdf = fmt::format("{:04x}:{:02x}:{:02x}.{:01x}",
+									(uint32_t)(bdfid >> 32), (uint32_t)((bdfid >> 8) & 0xFF), (uint32_t)((bdfid >> 3) & 0x1F), (uint32_t)(bdfid & 0x7));
+						}
+						if (gpus_slice[i].numa_socket < 0 and rsmi_topo_numa_affinity_get != nullptr) {
+							int32_t numa = -1;
+							if (rsmi_topo_numa_affinity_get(i, &numa) == RSMI_STATUS_SUCCESS and numa >= 0)
+								gpus_slice[i].numa_socket = numa;
+						}
+					#endif
     			}
 
 				//? GPU utilization
@@ -2066,6 +2362,39 @@ namespace Gpu {
 					gpus_slice[i].pcie_tx = -1;
 					gpus_slice[i].pcie_rx = -1;
 				}
+
+				//? Processes currently using this GPU (compute panel, RSMI 6+ only)
+				#if !defined(RSMI_STATIC)
+				if constexpr(not is_init) {
+					gpus_slice[i].procs.clear();
+					if (Config::getS("shown_boxes").contains("compute")
+						and rsmi_compute_process_info_get != nullptr) {
+						uint32_t num = 0;
+						if (rsmi_compute_process_info_get(nullptr, &num) == RSMI_STATUS_SUCCESS and num > 0 and num < 4096) {
+							vector<rsmi_proc_info_t> procs(num);
+							if (rsmi_compute_process_info_get(procs.data(), &num) == RSMI_STATUS_SUCCESS) {
+								for (uint32_t p = 0; p < num; p++) {
+									uint32_t ndev = 0;
+									if (rsmi_compute_process_gpus_get != nullptr
+										and (rsmi_compute_process_gpus_get(procs[p].process_id, nullptr, &ndev) != RSMI_STATUS_SUCCESS or ndev == 0))
+										continue;
+									vector<uint32_t> devs(ndev);
+									if (rsmi_compute_process_gpus_get(procs[p].process_id, devs.data(), &ndev) != RSMI_STATUS_SUCCESS
+										or not v_contains(devs, i))
+										continue;
+									rsmi_proc_info_t info{};
+									if (rsmi_compute_process_info_by_device_get == nullptr
+										or rsmi_compute_process_info_by_device_get(procs[p].process_id, i, &info) != RSMI_STATUS_SUCCESS)
+										continue;
+									const double util = (info.cu_occupancy == 0xFFFFFFFFu) ? 0.0 : (double)info.cu_occupancy;
+									auto& pr = gpus_slice[i].procs.emplace_back(info.process_id, info.vram_usage, util);
+									pr.name = get_proc_name(info.process_id);
+								}
+							}
+						}
+					}
+				}
+				#endif
     		}
 
 			return true;
@@ -2387,6 +2716,10 @@ namespace Gpu {
 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
 		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
+
+		//* Sort per-GPU process lists by VRAM for the compute panel
+		for (auto& gpu : gpus)
+			rng::sort(gpu.procs, [](const auto& a, const auto& b) { return a.vram > b.vram; });
 
 		//* Calculate average usage
 		long long avg = 0;
@@ -3600,6 +3933,11 @@ namespace Proc {
 									new_proc.mem = totalMem;
 								else
 									new_proc.mem = stoull(short_str) * Shared::pageSize;
+							next_x = 39;
+							continue;
+						case 39: //? CPU number the process last ran on (used for per-socket attribution)
+							new_proc.last_cpu = (int32_t)stoll(short_str);
+							break;
 						}
 						break;
 					}

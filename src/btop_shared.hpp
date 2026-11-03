@@ -126,12 +126,6 @@ namespace Gpu {
 
 	extern const array<string, 2> mem_names;
 
-	//* Container for process information // TODO
-	/*struct proc_info {
-    unsigned int pid;
-    unsigned long long mem;
-	};*/
-
 	//* Container for supported Gpu::*::collect() functions
 	struct gpu_info_supported {
 		bool gpu_utilization = true,
@@ -177,8 +171,20 @@ namespace Gpu {
 
 		gpu_info_supported supported_functions;
 
-		// vector<proc_info> graphics_processes = {}; // TODO
-		// vector<proc_info> compute_processes = {};
+		//* Processes currently using this GPU (populated when the vendor API supports it)
+		struct gpu_proc {
+			uint32_t pid{};
+			uint64_t vram{};  //? VRAM usage in bytes
+			double util{};    //? Per-process GPU utilization %, 0 = unknown
+			string name{};    //? Process name, empty when unknown
+		};
+		vector<gpu_proc> procs{};
+
+		//* Topology info (Linux only, populated at init, -1/0 = unknown)
+		string bdf{};         //? PCI BDF address, e.g. "0000:05:00.0"
+		int numa_socket = -1; //? CPU socket (NUMA node) this GPU is attached to
+		int pcie_gen = 0;     //? Negotiated PCIe generation
+		int pcie_width = 0;   //? Negotiated PCIe lane width
 	};
 
 	namespace Nvml {
@@ -220,6 +226,12 @@ namespace Cpu {
 	extern vector<int> thread_to_core;  //? Physical core id for each logical cpu
 	extern vector<string> pkg_cpuHz;    //? Frequency display string per socket
 	extern vector<float> pkg_watts;     //? Power draw in watts per socket
+
+	//* Memory attached to each socket via NUMA (empty when unavailable)
+	struct pkg_mem_info {
+		uint64_t total = 0, used = 0, available = 0; //? Bytes
+	};
+	extern vector<pkg_mem_info> pkg_mem;
 
 	struct cpu_info {
 		std::unordered_map<string, deque<long long>> cpu_percent = {
@@ -266,6 +278,23 @@ namespace Cpu {
 	auto get_battery() -> tuple<int, float, long, string>;
 
 	string trim_name(string);
+}
+
+//* Combined CPU socket + GPU panel showing devices with their interconnects (Linux)
+namespace Compute {
+	extern bool shown;
+	extern int x, y, width, height, min_width, min_height;
+	extern string box;
+
+	//* Draw contents of the compute panel using <cpu> and <gpus> as source
+	string draw(
+		const Cpu::cpu_info& cpu,
+#if defined(GPU_SUPPORT)
+		const vector<Gpu::gpu_info>& gpus,
+#endif
+		bool force_redraw = false,
+		bool data_same = false
+	);
 }
 
 namespace Mem {
@@ -401,6 +430,7 @@ namespace Proc {
 		uint64_t ppid{};
 		uint64_t cpu_s{};
 		uint64_t cpu_t{};
+		int32_t last_cpu = -1; //? CPU number the process last ran on, -1 = unknown
 		uint64_t death_time{};
 		string prefix{};        // defaults to ""
 		size_t depth{};
@@ -462,6 +492,24 @@ namespace Proc {
 
 	//* Auto-collapse processes with many direct children when entering tree mode
 	void _auto_collapse_oversized(std::vector<proc_info>& current_procs, const bool tree_mode_change);
+}
+
+namespace Topo {
+	//* Per-device top process entry for the compute panel
+	struct top_proc {
+		uint32_t pid{};
+		string name{};
+		double value{};   //? CPU % attributed to the socket by the process' last run CPU
+	};
+
+	//* Top process list per CPU socket, indexed by socket id
+	extern vector<vector<top_proc>> socket_tops;
+
+	//* Inter-socket link label for the compute panel (e.g. "UPI"), empty for single socket
+	extern string socket_link_label;
+
+	//* Build the per-socket top process lists from the full process list
+	void build_socket_tops(const vector<Proc::proc_info>& procs, int n);
 }
 
 /// Detect container engine.

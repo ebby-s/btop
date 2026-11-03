@@ -31,6 +31,7 @@ tab-size = 4
 namespace fs = std::filesystem;
 namespace rng = std::ranges;
 using namespace Tools;
+using std::max, std::min, std::cmp_greater;
 
 namespace Cpu {
     std::optional<std::string> container_engine;
@@ -39,6 +40,7 @@ namespace Cpu {
 	vector<int> thread_to_core;
 	vector<string> pkg_cpuHz;
 	vector<float> pkg_watts;
+	vector<pkg_mem_info> pkg_mem;
 
 	string trim_name(string name) {
 		auto name_vec = ssplit(name);
@@ -311,6 +313,39 @@ bool set_priority(pid_t pid, int priority) {
 			if (rng::count(current_procs, p.pid, &proc_info::ppid) >= threshold) {
 				p.collapsed = true;
 			}
+		}
+	}
+}
+
+namespace Topo {
+	vector<vector<top_proc>> socket_tops;
+	string socket_link_label;
+
+	//* Build the per-socket top process lists from the full process list.
+	//* A process is attributed to the socket that owns the CPU it last ran on,
+	//* which is the closest thing Linux exposes without eBPF instrumentation.
+	void build_socket_tops(const vector<Proc::proc_info>& procs, int n) {
+		socket_tops.clear();
+		if (n <= 0 or Cpu::thread_to_pkg.empty()) return;
+
+		int n_pkg = 1;
+		for (const int p : Cpu::thread_to_pkg) n_pkg = max(n_pkg, p + 1);
+		socket_tops.resize(n_pkg);
+
+		for (const auto& p : procs) {
+			if (p.cpu_p <= 0.0 or p.last_cpu < 0) continue;
+			if (cmp_greater(p.last_cpu, (int)Cpu::thread_to_pkg.size())) continue;
+			const int pkg = Cpu::thread_to_pkg.at(p.last_cpu);
+			if (pkg < 0 or cmp_greater(pkg, (int)socket_tops.size())) continue;
+			socket_tops.at(pkg).push_back({(uint32_t)p.pid, p.name, p.cpu_p});
+		}
+
+		for (auto& list : socket_tops) {
+			const size_t cut = min<size_t>(n, list.size());
+			if (cut > 1)
+				rng::partial_sort(list.begin(), list.begin() + cut, list.end(),
+					[](const auto& a, const auto& b) { return a.value > b.value; });
+			if (list.size() > (size_t)n) list.resize((size_t)n);
 		}
 	}
 }

@@ -506,6 +506,8 @@ namespace Runner {
 
 			//* Run collection and draw functions for all boxes
 			try {
+				//? The combined compute panel replaces the classic cpu and gpu panels
+				const bool compute_on = v_contains(conf.boxes, "compute");
 #if defined(GPU_SUPPORT)
 				//? GPU data collection
 				const bool gpu_in_cpu_panel = Gpu::gpu_names.size() > 0 and (
@@ -513,12 +515,15 @@ namespace Runner {
 					or (Config::getS("cpu_graph_lower") == "Auto")
 					or Config::getS("cpu_graph_upper").starts_with("gpu-")
 					or (Gpu::shown == 0 and Config::getS("show_gpu_info") != "Off")
+					or compute_on
 				);
 
+				//? The compute panel replaces the classic gpu panels
 				vector<unsigned int> gpu_panels = {};
-				for (auto& box : conf.boxes)
-					if (box.starts_with("gpu"))
-						gpu_panels.push_back(box.back()-'0');
+				if (not compute_on)
+					for (auto& box : conf.boxes)
+						if (box.starts_with("gpu"))
+							gpu_panels.push_back(box.back()-'0');
 
 				vector<Gpu::gpu_info> gpus;
 				if (gpu_in_cpu_panel or not gpu_panels.empty()) {
@@ -529,8 +534,8 @@ namespace Runner {
 				auto& gpus_ref = gpus;
 #endif // GPU_SUPPORT
 
-				//? CPU
-				if (v_contains(conf.boxes, "cpu")) {
+				//? CPU (also feeds the combined compute panel)
+				if (v_contains(conf.boxes, "cpu") or compute_on) {
 					try {
 						if (Global::debug) debug_timer("cpu", collect_begin);
 
@@ -549,14 +554,29 @@ namespace Runner {
 
 						//? Draw box
 						if (not pause_output) {
-							output += Cpu::draw(
-								cpu,
+							if (compute_on) {
+								//? Per-socket process attribution needs the proc list even when the proc box is hidden
+								if (not v_contains(conf.boxes, "proc"))
+									Topo::build_socket_tops(Proc::collect(conf.no_update), Config::getI("compute_top_procs"));
+								output += Compute::draw(
+									cpu,
 #if defined(GPU_SUPPORT)
-								gpus_ref,
+									gpus_ref,
 #endif // GPU_SUPPORT
-								conf.force_redraw,
-								conf.no_update
-							);
+									conf.force_redraw,
+									conf.no_update
+								);
+							}
+							else {
+								output += Cpu::draw(
+									cpu,
+#if defined(GPU_SUPPORT)
+									gpus_ref,
+#endif // GPU_SUPPORT
+									conf.force_redraw,
+									conf.no_update
+								);
+							}
 						}
 
 						if (Global::debug) debug_timer("cpu", draw_done);
@@ -631,6 +651,10 @@ namespace Runner {
 						//? Start collect
 						auto proc = Proc::collect(conf.no_update);
 
+						//? Feed per-socket top process lists to the compute panel
+						if (compute_on)
+							Topo::build_socket_tops(proc, Config::getI("compute_top_procs"));
+
 						if (Global::debug) debug_timer("proc", draw_begin);
 
 						//? Draw box
@@ -674,8 +698,9 @@ namespace Runner {
 						"{mv4}{hiFg}3 {mainFg}| Show NET box"
 						"{mv5}{hiFg}4 {mainFg}| Show PROC box"
 						"{mv6}{hiFg}5-0 {mainFg}| Show GPU boxes"
-						"{mv7}{hiFg}esc {mainFg}| Show menu"
-						"{mv8}{hiFg}q {mainFg}| Quit",
+						"{mv7}{hiFg}v {mainFg}| Show COMPUTE box"
+						"{mv8}{hiFg}esc {mainFg}| Show menu"
+						"{mv9}{hiFg}q {mainFg}| Quit",
 						"banner"_a = Draw::banner_gen(y, 0, true),
 						"titleFg"_a = Theme::c("title"), "b"_a = Fx::b, "hiFg"_a = Theme::c("hi_fg"), "mainFg"_a = Theme::c("main_fg"),
 						"mv1"_a = Mv::to(y+6, x),
@@ -684,8 +709,9 @@ namespace Runner {
 						"mv4"_a = Mv::to(y+10, x),
 						"mv5"_a = Mv::to(y+11, x),
 						"mv6"_a = Mv::to(y+12, x-2),
-						"mv7"_a = Mv::to(y+13, x-2),
-						"mv8"_a = Mv::to(y+14, x)
+						"mv7"_a = Mv::to(y+13, x),
+						"mv8"_a = Mv::to(y+14, x-2),
+						"mv9"_a = Mv::to(y+15, x)
 					);
 				}
 				output += empty_bg;

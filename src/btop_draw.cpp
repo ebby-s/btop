@@ -1059,6 +1059,490 @@ namespace Cpu {
 
 }
 
+//* Combined CPU socket + GPU panel: sockets in a top row, each GPU stacked below its parent
+//* socket, with the UPI/QPI link between sockets and the PCIe links down to the GPUs drawn in
+//* the gaps. Each device box carries its coupled memory (socket NUMA RAM, GPU VRAM) and its
+//* own top process list.
+namespace Compute {
+	int height_p = 45;
+	int min_width = 60, min_height = 12;
+	int x = 1, y = 1, width = 20, height = 10;
+	bool shown = false, redraw = true;
+	string box;
+
+	//* Device box geometry, filled on redraw
+	struct dev_box { int x, y, w, h; };
+	vector<dev_box> socket_boxes;
+	vector<dev_box> gpu_boxes;
+	vector<int> gpu_col;             //? Column (socket) each GPU is drawn in
+	vector<int> gpu_pos_in_col;      //? Stack position of the GPU within its column
+	vector<vector<int>> pkg_threads; //? Thread ids per socket, SMT siblings adjacent, ordered by core id
+	vector<array<int, 4>> dot_cells; //? {socket, thread id, grid row, grid column}
+	int n_pkg = 1, col_w = 10, col_gap = 1;
+	int dot_rows = 1, tops = 0;
+	int fixed_s = 3;                 //? Fixed socket content rows (summary, RAM, tops base)
+	int fixed_g = 4;                 //? Fixed GPU content rows (util, PWR, VRAM, PCIe)
+	int link_row = 0;                //? Row of the PCIe links between socket row and GPU stacks
+	bool show_links = true;
+	int threads_per_core = 1;
+
+	vector<Draw::Meter> socket_meters;        //? RAM meter per socket
+	vector<array<Draw::Meter, 3>> gpu_meters; //? {util, pwr, vram} meter per GPU
+
+	string draw(
+		const Cpu::cpu_info& cpu,
+#if defined(GPU_SUPPORT)
+		const vector<Gpu::gpu_info>& gpus,
+#endif // GPU_SUPPORT
+		bool force_redraw,
+		bool data_same
+	) {
+		(void)data_same;
+		if (Runner::stopping) return "";
+		if (force_redraw) redraw = true;
+		const bool show_temps = Config::getB("check_temp");
+		const auto& temp_scale = Config::getS("temp_scale");
+		auto tty_mode = Config::getB("tty_mode");
+		auto& graph_symbol = (tty_mode ? "tty" : Config::getS("graph_symbol_cpu"));
+		auto& thread_dot = Symbols::graph_symbols.at((graph_symbol == "default" ? Config::getS("graph_symbol") + "_up" : graph_symbol + "_up")).at(1);
+		auto cpu_bottom = Config::getB("cpu_bottom");
+
+		const auto safe_cpu_temp_max = cpu.temp_max <= 0 ? 90 : cpu.temp_max;
+		const string& title_left = Theme::c("cpu_box") + (cpu_bottom ? Symbols::title_left_down : Symbols::title_left);
+		const string& title_right = Theme::c("cpu_box") + (cpu_bottom ? Symbols::title_right_down : Symbols::title_right);
+
+		if (safeVal(cpu.cpu_percent, "total"s).empty() or safeVal(cpu.core_percent, 0).empty()) return "";
+
+		string out;
+		out.reserve(width * height);
+
+		//* Redraw elements not needed to be updated every cycle
+		if (redraw) {
+			redraw = false;
+			box.clear();
+
+			//? Sockets and their threads
+			n_pkg = 1;
+			for (const auto& p : Cpu::thread_to_pkg) n_pkg = max(n_pkg, p + 1);
+			const auto core_of = [](const int t) {
+				return cmp_less(t, (int)Cpu::thread_to_core.size()) ? Cpu::thread_to_core.at(t) : t;
+			};
+			pkg_threads.assign(n_pkg, {});
+			if (not Cpu::thread_to_pkg.empty()) {
+				for (const int& t : iota(0, (int)Shared::coreCount))
+					if (cmp_less(t, (int)Cpu::thread_to_pkg.size()) and Cpu::thread_to_pkg.at(t) >= 0)
+						pkg_threads.at(Cpu::thread_to_pkg.at(t)).push_back(t);
+				for (auto& plist : pkg_threads)
+					rng::sort(plist, [&](const int a, const int b) {
+						return core_of(a) != core_of(b) ? core_of(a) < core_of(b) : a < b;
+					});
+			}
+			else {
+				for (const int& t : iota(0, (int)Shared::coreCount))
+					pkg_threads[0].push_back(t);
+			}
+			threads_per_core = 1;
+			for (const auto& plist : pkg_threads) {
+				int run = 1;
+				for (size_t i = 1; i < plist.size(); i++) {
+					run = core_of(plist[i]) == core_of(plist[i - 1]) ? run + 1 : 1;
+					threads_per_core = max(threads_per_core, run);
+				}
+			}
+
+			//? One column per socket, with a wider gap to host the inter-socket link label
+			show_links = Config::getB("compute_show_links");
+			col_gap = 1;
+			if (n_pkg > 1 and show_links and not Topo::socket_link_label.empty())
+				col_gap = max(1, min((int)Topo::socket_link_label.size() + 2, (width - 2 - 12 * n_pkg) / (n_pkg - 1)));
+			col_w = max(12, (width - 2 - (n_pkg - 1) * col_gap) / n_pkg);
+
+			//? Assign each GPU to the column of its socket, balancing unknowns
+#if defined(GPU_SUPPORT)
+			const bool any_gpu = not gpus.empty();
+#else
+			const bool any_gpu = false;
+			(void)any_gpu;
+#endif
+			vector<int> col_count(n_pkg, 0);
+#if defined(GPU_SUPPORT)
+			gpu_col.assign(gpus.size(), 0);
+			gpu_pos_in_col.assign(gpus.size(), 0);
+			for (size_t i = 0; i < gpus.size(); i++) {
+				int c = gpus[i].numa_socket;
+				if (c < 0 or c >= n_pkg) {
+					if (n_pkg == 1) c = 0; //? Non-NUMA systems report -1; a single socket can only be 0
+					else {
+						c = 0;
+						for (int k = 1; k < n_pkg; k++)
+							if (col_count[k] < col_count[c]) c = k;
+					}
+				}
+				gpu_col[i] = c;
+				gpu_pos_in_col[i] = col_count[c]++;
+			}
+#endif
+			int max_col_gpus = 0;
+			for (const int c : col_count) max_col_gpus = max(max_col_gpus, c);
+
+			//? Vertical budget: shrink the top process lists first, then the GPU aux rows
+			fixed_s = 3;
+			fixed_g = 4;
+			tops = clamp(Config::getI("compute_top_procs"), 0, 10);
+			const auto gpu_block_h = [&](const int t) {
+				return any_gpu ? 1 + max_col_gpus * (fixed_g + t + 3) - 1 : 0;
+			};
+			while (tops > 0 and 2 + fixed_s + 2 + tops + gpu_block_h(tops) > height) tops--;
+			if (2 + fixed_s + 2 + gpu_block_h(0) > height) {
+				while (fixed_g > 2 and 2 + fixed_s + 2 + gpu_block_h(0) > height) fixed_g--;
+				tops = 0;
+			}
+
+			//? Dot grid: every thread placed at (row, column) inside its socket box
+			const auto tpc = max(1, threads_per_core);
+			const auto dots_to_chars = [tpc](const int dots) { return dots + max(0, (dots + tpc - 1) / tpc - 1); };
+			const auto chars_to_dots = [&](const int chars) {
+				if (chars <= 0) return 0;
+				int dots = min(chars, chars * tpc / max(1, tpc + 1));
+				while (dots_to_chars(dots + 1) <= chars) dots++;
+				return max(dots, 1);
+			};
+			int max_needed_rows = 1;
+			for (const auto& plist : pkg_threads)
+				max_needed_rows = max(max_needed_rows, (int)ceil((double)plist.size() / max(1, chars_to_dots(col_w - 2))));
+			dot_rows = max(1, min(max_needed_rows, height - 2 - fixed_s - 2 - tops - gpu_block_h(tops)));
+
+			//? Device box placement
+			socket_boxes.clear();
+			gpu_boxes.clear();
+			const int sy = y + 1;
+			const int sh = dot_rows + fixed_s + tops + 2;
+			for (int p = 0; p < n_pkg; p++)
+				socket_boxes.push_back({x + 1 + p * (col_w + col_gap), sy, col_w, sh});
+			link_row = sy + sh;
+			const int gh = fixed_g + tops + 2;
+#if defined(GPU_SUPPORT)
+			for (size_t i = 0; i < gpus.size(); i++)
+				gpu_boxes.push_back({x + 1 + gpu_col[i] * (col_w + col_gap),
+					(show_links ? link_row + 1 : link_row) + gpu_pos_in_col[i] * (gh + 1), col_w, gh});
+#endif
+
+			dot_cells.clear();
+			for (int p = 0; p < n_pkg; p++) {
+				const auto& plist = pkg_threads.at(p);
+				const int avail = col_w - 2;
+				int xoff = 0, row = 0;
+				bool first_in_row = true;
+				for (size_t i = 0; i < plist.size(); i++) {
+					const int core = core_of(plist[i]);
+					size_t j = i;
+					while (j < plist.size() and core_of(plist[j]) == core) j++;
+					const int group = min((int)(j - i), avail);
+					if (not first_in_row and xoff + 1 + group - 1 > avail - 1) {
+						row++;
+						xoff = 0;
+						first_in_row = true;
+					}
+					if (row >= dot_rows or (not first_in_row and xoff + group > avail)) break;
+					if (not first_in_row) xoff++;
+					for (const int& k : iota(0, group))
+						dot_cells.push_back({p, plist[i + k], row, xoff++});
+					first_in_row = false;
+					i = j - 1;
+				}
+			}
+
+			//? Meters
+			socket_meters.resize(n_pkg);
+			for (int p = 0; p < n_pkg; p++)
+				socket_meters[p] = Draw::Meter{max(4, col_w - 24), "used"};
+#if defined(GPU_SUPPORT)
+			gpu_meters.resize(gpus.size());
+			for (size_t i = 0; i < gpus.size(); i++) {
+				gpu_meters[i][0] = Draw::Meter{max(4, col_w - 24), "cpu"};
+				gpu_meters[i][1] = Draw::Meter{max(4, col_w - 24), "cached"};
+				gpu_meters[i][2] = Draw::Meter{max(4, col_w - 24), "used"};
+			}
+#endif
+
+			//? Outer box with the usual title buttons
+			box = Draw::createBox(x, y, width, height, Theme::c("cpu_box"), true, "compute", "", 1);
+			const int button_y = cpu_bottom ? y + height - 1 : y;
+			out += Mv::to(button_y, x + 10) + title_left + Theme::c("hi_fg") + Fx::b + 'm' + Theme::c("title") + "enu" + Fx::ub + title_right;
+			Input::mouse_mappings["m"] = {button_y, x + 11, 1, 4};
+			out += Mv::to(button_y, x + 16) + title_left + Theme::c("hi_fg") + Fx::b + 'p' + Theme::c("title") + "reset "
+				+ (!Config::current_preset.has_value() ? "*" : to_string(Config::current_preset.value())) + Fx::ub + title_right;
+			Input::mouse_mappings["p"] = {button_y, x + 17, 1, 8};
+			const string update = to_string(Config::getI("update_ms")) + "ms";
+			out += Mv::to(button_y, x + width - (int)update.size() - 8) + title_left + Fx::b + Theme::c("hi_fg") + "- " + Theme::c("title") + update
+				+ Theme::c("hi_fg") + " +" + Fx::ub + title_right;
+			Input::mouse_mappings["-"] = {button_y, x + width - (int)update.size() - 7, 1, 2};
+			Input::mouse_mappings["+"] = {button_y, x + width - 5, 1, 2};
+
+			//? Device boxes
+			for (size_t p = 0; p < socket_boxes.size(); p++) {
+				const auto& b = socket_boxes[p];
+				box += Draw::createBox(b.x, b.y, b.w, b.h, "", false, "socket " + to_string(p));
+			}
+#if defined(GPU_SUPPORT)
+			for (size_t i = 0; i < gpu_boxes.size(); i++) {
+				const auto& b = gpu_boxes[i];
+				string name = Config::getS(string("custom_gpu_name") + to_string(i));
+				if (name.empty()) name = Gpu::gpu_names[i];
+				box += Draw::createBox(b.x, b.y, b.w, b.h, "", false, uresize(name, b.w - 4));
+			}
+
+			//? Inter-socket link (UPI/QPI) drawn in the column gaps
+			if (n_pkg > 1 and show_links and not Topo::socket_link_label.empty()) {
+				const int mid = sy + sh / 2;
+				for (int p = 0; p + 1 < n_pkg; p++) {
+					const int gx = x + 1 + (p + 1) * col_w + p * col_gap;
+					box += Mv::to(mid, gx) + Theme::c("div_line") + Symbols::h_line * col_gap;
+					box += Mv::to(mid, gx + 1) + Theme::c("title") + Fx::b + Topo::socket_link_label + Fx::ub;
+				}
+			}
+
+			//? PCIe link from each GPU up to its socket (dotted when the socket is unknown)
+			if (show_links) {
+				for (size_t i = 0; i < gpu_boxes.size(); i++) {
+					const auto& b = gpu_boxes[i];
+					const int cx = b.x + b.w / 2;
+					if (b.y > link_row + 1) {
+						//? Stacked under another GPU in the same column: short connector only
+						box += Mv::to(b.y - 1, cx) + Theme::c("div_line") + Symbols::v_line;
+						continue;
+					}
+					const bool known = (gpus[i].numa_socket >= 0);
+					box += Mv::to(link_row, cx) + Theme::c("div_line") + (known ? Symbols::v_line : Symbols::dotted_v_line);
+					string lbl = "PCIe";
+					if (gpus[i].pcie_gen > 0)
+						lbl = fmt::format("Gen{} x{}", gpus[i].pcie_gen, max(1, gpus[i].pcie_width));
+					const int lx = (cx + 2 + (int)lbl.size() <= b.x + b.w - 1) ? cx + 1 : max(b.x + 1, cx - 1 - (int)lbl.size());
+					box += Mv::to(link_row, lx) + Theme::c("main_fg") + lbl;
+				}
+			}
+#endif
+
+			out += box;
+		}
+
+		auto is_cpu_enabled = [&cpu](const std::int32_t num) -> bool {
+			return !cpu.active_cpus.has_value() || std::ranges::find(cpu.active_cpus.value(), num) != cpu.active_cpus.value().end();
+		};
+
+		//* Socket boxes: dot grid, frequency/temperature/power, NUMA RAM, top processes
+		try {
+			for (size_t p = 0; p < socket_boxes.size(); p++) {
+				const auto& b = socket_boxes[p];
+				const int avail = b.w - 2;
+
+				//? Per-thread utilization dots
+				std::map<int, vector<array<int, 2>>> grid_rows_cells;
+				for (const auto& cell : dot_cells)
+					if (cell[0] == (int)p)
+						grid_rows_cells[cell[2]].push_back({cell[1], cell[3]});
+				for (const auto& [gy, cells] : grid_rows_cells) {
+					if (gy >= dot_rows) continue;
+					out += Mv::to(b.y + 1 + gy, b.x + 1);
+					int cur_col = 0;
+					for (const auto& [thread, gc] : cells) {
+						if (gc > cur_col)
+							out += string(gc - cur_col, ' ');
+						const long long util = safeVal(cpu.core_percent, thread).empty() ? 0 : safeVal(cpu.core_percent, thread).back();
+						out += (is_cpu_enabled(thread) ? Theme::g("cpu").at(clamp(util, 0ll, 100ll)) : Theme::c("inactive_fg")) + thread_dot;
+						cur_col = gc + 1;
+					}
+					if (cur_col < avail)
+						out += string(avail - cur_col, ' ');
+				}
+
+				//? Frequency, temperature and power draw
+				const int sum_y = b.y + 1 + dot_rows;
+				if (sum_y <= b.y + b.h - 2) {
+					out += Mv::to(sum_y, b.x + 1) + Theme::c("main_fg") + Fx::b + "P" + to_string(p) + Fx::ub;
+					int used = 2 + (int)to_string(p).size();
+					string freq;
+					if (Config::getB("show_cpu_freq")) {
+						if (cmp_less((int)p, (int)Cpu::pkg_cpuHz.size()) and not Cpu::pkg_cpuHz.at(p).empty())
+							freq = Cpu::pkg_cpuHz.at(p);
+						else if (n_pkg == 1 and not Cpu::cpuHz.empty())
+							freq = Cpu::cpuHz;
+					}
+					if (not freq.empty() and used + 1 + (int)freq.size() <= avail) {
+						out += ' ' + Theme::c("main_fg") + freq;
+						used += 1 + (int)freq.size();
+					}
+					if (show_temps) {
+						long long pkg_temp = -1;
+						if (Config::getB("show_coretemp") and not Cpu::cpu_temp_only and not Cpu::thread_to_pkg.empty() and cmp_less((int)p, (int)pkg_threads.size())) {
+							for (const auto& t : pkg_threads.at(p)) {
+								if (not safeVal(cpu.temp, t + 1).empty())
+									pkg_temp = max(pkg_temp, safeVal(cpu.temp, t + 1).back());
+							}
+						}
+						if (pkg_temp < 0 and p == 0 and not safeVal(cpu.temp, 0).empty())
+							pkg_temp = safeVal(cpu.temp, 0).back();
+						if (pkg_temp >= 0 and used + 7 <= avail) {
+							const auto [temp, unit] = celsius_to(pkg_temp, temp_scale);
+							out += ' ' + Theme::g("temp").at(clamp(pkg_temp * 100 / safe_cpu_temp_max, 0ll, 100ll))
+								+ rjust(to_string(temp), 4) + Theme::c("main_fg") + unit;
+							used += 1 + 4 + (int)unit.size();
+						}
+					}
+					if (Config::getB("show_cpu_watts") and Cpu::supports_watts) {
+						float pkg_w = -1.0f;
+						if (cmp_less((int)p, (int)Cpu::pkg_watts.size()))
+							pkg_w = Cpu::pkg_watts.at(p);
+						else if (n_pkg == 1)
+							pkg_w = cpu.usage_watts;
+						if (pkg_w >= 0.0f and used + 6 <= avail) {
+							const auto clamped_watts = clamp(pkg_w, 0.0f, 999.0f);
+							Cpu::max_observed_pwr = max(Cpu::max_observed_pwr, clamped_watts);
+							out += Theme::g("cached").at(clamp(clamped_watts / Cpu::max_observed_pwr * 100.0f, 0.0f, 100.0f))
+								+ fmt::format(" {:>4.{}f}", clamped_watts, clamped_watts < 9.995f ? 2 : clamped_watts < 99.95f ? 1 : 0)
+								+ Theme::c("main_fg") + 'W';
+							used += 6;
+						}
+					}
+					if (used < avail)
+						out += string(avail - used, ' ');
+				}
+
+				//? NUMA RAM attached to this socket
+				const int ram_y = sum_y + 1;
+				if (ram_y <= b.y + b.h - 2) {
+					const auto& pm = (cmp_less((int)p, (int)Cpu::pkg_mem.size()) ? Cpu::pkg_mem.at(p) : Cpu::pkg_mem_info{});
+					if (pm.total > 0) {
+						const int pct = (int)round((double)pm.used * 100.0 / (double)pm.total);
+						out += Mv::to(ram_y, b.x + 1) + Theme::c("main_fg") + Fx::b + "RAM" + Fx::ub + ' '
+							+ socket_meters[p](pct) + ' '
+							+ rjust(floating_humanizer(pm.used, true), 5) + Theme::c("inactive_fg") + '/' + Theme::c("main_fg")
+							+ ljust(floating_humanizer(pm.total, true), 5) + ' '
+							+ Theme::g("used").at(clamp(pct, 0, 100)) + rjust(to_string(pct), 3) + Theme::c("main_fg") + '%';
+					}
+					else
+						out += Mv::to(ram_y, b.x + 1) + Theme::c("inactive_fg") + "RAM n/a";
+				}
+
+				//? Top processes attributed to this socket (last run CPU heuristic)
+				const auto& tops_list = (cmp_less((int)p, (int)Topo::socket_tops.size()) ? Topo::socket_tops.at(p) : std::vector<Topo::top_proc>{});
+				for (int t = 0; t < tops; t++) {
+					const int ry = ram_y + 1 + t;
+					if (ry > b.y + b.h - 2) break;
+					if (t < (int)tops_list.size()) {
+						const auto& tp = tops_list.at(t);
+						out += Mv::to(ry, b.x + 1) + Theme::c("main_fg") + Fx::b + ljust(tp.name, max(4, avail - 6)) + Fx::ub
+							+ Theme::g("cpu").at(clamp((long long)tp.value, 0ll, 100ll))
+							+ rjust(fmt::format("{:.1f}", tp.value), 4) + Theme::c("main_fg") + '%';
+					}
+				}
+			}
+		}
+		catch (const std::exception& e) {
+			throw std::runtime_error("compute socket box : " + string{e.what()});
+		}
+
+#if defined(GPU_SUPPORT)
+		//* GPU boxes: utilization, power, VRAM, PCIe link, top processes
+		try {
+			const int meter_w = max(4, col_w - 24);
+			for (size_t i = 0; i < gpu_boxes.size(); i++) {
+				const auto& b = gpu_boxes[i];
+				const auto& gpu = gpus[i];
+				const int avail = b.w - 2;
+
+				//? Utilization, clock and temperature
+				int used = 0;
+				if (gpu.supported_functions.gpu_utilization) {
+					const long long util = safeVal(gpu.gpu_percent, "gpu-totals"s).back();
+					out += Mv::to(b.y + 1, b.x + 1) + gpu_meters[i][0](util) + ' '
+						+ Theme::g("cpu").at(clamp(util, 0ll, 100ll)) + rjust(to_string(util), 3) + Theme::c("main_fg") + '%';
+					used = meter_w + 6;
+				}
+				if (gpu.supported_functions.gpu_clock and gpu.gpu_clock_speed > 0 and used + 8 <= avail) {
+					out += ' ' + rjust(to_string(gpu.gpu_clock_speed), 4) + Theme::c("main_fg") + "MHz";
+					used += 8;
+				}
+				if (show_temps and gpu.supported_functions.temp_info and not gpu.temp.empty() and gpu.temp.back() > 0 and used + 7 <= avail) {
+					const long long t = gpu.temp.back();
+					const auto [temp, unit] = celsius_to(t, temp_scale);
+					out += ' ' + Theme::g("temp").at(clamp(t * 100 / max(1LL, gpu.temp_max), 0ll, 100ll))
+						+ rjust(to_string(temp), 4) + Theme::c("main_fg") + unit;
+					used += 1 + 4 + (int)unit.size();
+				}
+				if (used < avail)
+					out += string(avail - used, ' ');
+
+				//? Power draw and pstate
+				if (fixed_g >= 3 and gpu.supported_functions.pwr_usage) {
+					const int ry = b.y + 2;
+					if (ry <= b.y + b.h - 2) {
+						const int pw_pct = (gpu.pwr_max_usage > 0
+							? (int)round((double)gpu.pwr_usage * 100.0 / (double)gpu.pwr_max_usage) : 0);
+						out += Mv::to(ry, b.x + 1) + Theme::c("main_fg") + Fx::b + "PWR" + Fx::ub + ' '
+							+ gpu_meters[i][1](clamp(pw_pct, 0, 100)) + ' '
+							+ fmt::format("{:>5.{}f}", gpu.pwr_usage / 1000.0, gpu.pwr_usage < 10'000 ? 2 : gpu.pwr_usage < 100'000 ? 1 : 0)
+							+ Theme::c("main_fg") + 'W';
+						int used2 = meter_w + 11;
+						if (gpu.supported_functions.pwr_state and gpu.pwr_state != 32 and used2 + 4 <= avail) // NVML_PSTATE_UNKNOWN
+							out += Theme::c("inactive_fg") + " P" + to_string(gpu.pwr_state);
+					}
+				}
+
+				//? VRAM
+				if (fixed_g >= 2 and gpu.supported_functions.mem_used and gpu.supported_functions.mem_total and gpu.mem_total > 0) {
+					const int ry = b.y + 3;
+					if (ry <= b.y + b.h - 2) {
+						const int pct = safeVal(gpu.gpu_percent, "gpu-vram-totals"s).back();
+						out += Mv::to(ry, b.x + 1) + Theme::c("main_fg") + Fx::b + "VRAM" + Fx::ub + ' '
+							+ gpu_meters[i][2](pct) + ' '
+							+ rjust(floating_humanizer(gpu.mem_used, true), 5) + Theme::c("inactive_fg") + '/' + Theme::c("main_fg")
+							+ ljust(floating_humanizer(gpu.mem_total, true), 5) + ' '
+							+ Theme::g("used").at(clamp(pct, 0, 100)) + rjust(to_string(pct), 3) + Theme::c("main_fg") + '%';
+					}
+				}
+
+				//? PCIe link state and throughput
+				if (fixed_g >= 4) {
+					const int ry = b.y + 4;
+					if (ry <= b.y + b.h - 2) {
+						string lbl = "n/a";
+						if (gpu.pcie_gen > 0)
+							lbl = fmt::format("Gen{} x{}", gpu.pcie_gen, max(1, gpu.pcie_width));
+						out += Mv::to(ry, b.x + 1) + Theme::c("main_fg") + Fx::b + "PCIe" + Fx::ub + ' ' + lbl;
+						int used3 = 5 + (int)lbl.size();
+						if (gpu.supported_functions.pcie_txrx and not (gpu.pcie_tx < 0 or gpu.pcie_rx < 0) and used3 + 16 <= avail) {
+							out += Theme::c("inactive_fg") + " " + rjust(floating_humanizer(gpu.pcie_tx, 0, 1, 0, 1), 6) + "↓"
+								+ ' ' + rjust(floating_humanizer(gpu.pcie_rx, 0, 1, 0, 1), 6) + "↑";
+						}
+					}
+				}
+
+				//? Top processes running on this GPU
+				for (int t = 0; t < tops; t++) {
+					const int ry = b.y + 1 + fixed_g + t;
+					if (ry > b.y + b.h - 2) break;
+					if (t < (int)gpu.procs.size()) {
+						const auto& gp = gpu.procs.at(t);
+						const string name = gp.name.empty() ? to_string(gp.pid) : gp.name;
+						string tail = floating_humanizer(gp.vram, true);
+						if (gp.util > 0.0)
+							tail += ' ' + fmt::format("{:.0f}%", gp.util);
+						out += Mv::to(ry, b.x + 1) + Theme::c("main_fg") + Fx::b + ljust(name, max(4, avail - (int)tail.size() - 1)) + Fx::ub
+							+ Theme::c("main_fg") + tail;
+					}
+				}
+			}
+		}
+		catch (const std::exception& e) {
+			throw std::runtime_error("compute gpu box : " + string{e.what()});
+		}
+#endif // GPU_SUPPORT
+
+		return out + Fx::reset;
+	}
+}
+
 #ifdef GPU_SUPPORT
 namespace Gpu {
 	int width_p = 100, height_p = 32;
@@ -2311,6 +2795,12 @@ namespace Draw {
 		Cpu::redraw = Mem::redraw = Net::redraw = Proc::redraw = true;
 
 		Cpu::shown = boxes.contains("cpu");
+		Compute::box.clear();
+		Compute::redraw = true;
+		//? The combined compute panel takes the place of the classic cpu and gpu panels
+		Compute::shown = boxes.contains("compute");
+		if (Compute::shown)
+			Cpu::shown = false;
 	#ifdef GPU_SUPPORT
 		Gpu::box.clear();
 		Gpu::shown_panels.clear();
@@ -2322,6 +2812,8 @@ namespace Draw {
 					Gpu::shown_panels.push_back(current.back()-'0');
 			}
 		}
+		if (Compute::shown)
+			Gpu::shown_panels.clear();
 		Gpu::shown = Gpu::shown_panels.size();
 
 		//? Panels are laid out in a grid when the terminal is landscape (width >= height),
@@ -2349,6 +2841,18 @@ namespace Draw {
 		Mem::shown = boxes.contains("mem");
 		Net::shown = boxes.contains("net");
 		Proc::shown = boxes.contains("proc");
+
+		//* Calculate and draw compute box outlines (device layout is done in Compute::draw on redraw)
+		if (Compute::shown) {
+			Compute::width = Term::width;
+			Compute::height = max(Compute::min_height, (int)ceil((double)Term::height * (trim(boxes) == "compute" ? 100 : Compute::height_p) / 100));
+			Compute::x = 1;
+			Compute::y = cpu_bottom ? Term::height - Compute::height + 1 : 1;
+			//? Cpu::width/Cpu::height double as the top panel size for the mem/net/proc layout
+			//? below and for the cpu history trimming in Cpu::collect
+			Cpu::width = Compute::width;
+			Cpu::height = Compute::height;
+		}
 
 		//* Calculate and draw cpu box outlines
 		if (Cpu::shown) {
@@ -2687,7 +3191,7 @@ namespace Draw {
 		#endif
 			x = proc_left ? 1 : Term::width - width + 1;
 		#ifdef GPU_SUPPORT
-			y = ((cpu_bottom and Cpu::shown) ? 1 : Cpu::height + 1) + Gpu::total_height;
+			y = ((cpu_bottom and (Cpu::shown or Compute::shown)) ? 1 : Cpu::height + 1) + Gpu::total_height;
 		#else
 			y = (cpu_bottom and Cpu::shown) ? 1 : Cpu::height + 1;
 		#endif

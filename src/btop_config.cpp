@@ -52,6 +52,7 @@ const vector<string> Config::valid_graph_symbols_def = { "default", "braille", "
 const vector<string> Config::valid_boxes = {
 	"cpu", "mem", "net", "proc"
 #ifdef GPU_SUPPORT
+	,"compute"
 	,"gpu0", "gpu1", "gpu2", "gpu3", "gpu4", "gpu5"
 #endif
 };
@@ -171,6 +172,10 @@ namespace Config {
 		{"show_uptime", 		"#* Shows the system uptime in the CPU box."},
 
 		{"show_cpu_watts",		"#* Shows the CPU package current power consumption in watts. Requires running `make setcap` or `make setuid` or running with sudo."},
+	#ifdef GPU_SUPPORT
+		{"compute_top_procs", 	"#* Number of top processes shown in each device box of the combined compute panel, min 0, max 10."},
+		{"compute_show_links", 	"#* Show the PCIe/UPI/QPI connection lines between devices in the combined compute panel."},
+	#endif
 
 		{"check_temp", 			"#* Show cpu temperature."},
 
@@ -371,6 +376,7 @@ namespace Config {
 		{"update_following", false},
 		{"should_selection_return_to_followed", false},
 	#ifdef GPU_SUPPORT
+		{"compute_show_links", true},
 		{"nvml_measure_pcie_speeds", true},
 		{"rsmi_measure_pcie_speeds", true},
 		{"gpu_mirror_graph", true},
@@ -395,6 +401,9 @@ namespace Config {
 		{"proc_selected", 0},
 		{"proc_last_selected", 0},
 		{"proc_followed", 0},
+	#ifdef GPU_SUPPORT
+		{"compute_top_procs", 4},
+	#endif
 	};
 	std::unordered_map<std::string_view, int> intsTmp;
 
@@ -585,6 +594,9 @@ namespace Config {
 
 		else if (name == "proc_tree_auto_collapse" and i_value > 10000)
 			validError = "Config value proc_tree_auto_collapse set too high (>10000).";
+
+		else if (name == "compute_top_procs" and (i_value < 0 or i_value > 10))
+			validError = "Config value compute_top_procs must be between 0 and 10.";
 
 		else
 			return true;
